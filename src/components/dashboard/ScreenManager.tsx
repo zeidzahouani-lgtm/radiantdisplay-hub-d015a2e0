@@ -473,9 +473,16 @@ export function ScreenManager() {
                 {/* Media selector */}
                 <Select
                   value={screen.current_media_id ?? "none"}
-                  onValueChange={(val) =>
-                    updateScreen.mutate({ id: screen.id, current_media_id: val === "none" ? null : val })
-                  }
+                  onValueChange={(val) => {
+                    const isMedia = val !== "none";
+                    // Assigning a single media clears playlist/program so it isn't
+                    // overwritten by the rotation logic in useScreenRealtime.
+                    updateScreen.mutate({
+                      id: screen.id,
+                      current_media_id: isMedia ? val : null,
+                      ...(isMedia ? { playlist_id: null, program_id: null } : {}),
+                    } as any);
+                  }}
                 >
                   <SelectTrigger className="w-[140px] sm:w-[200px]">
                     <SelectValue placeholder="Sélectionner un média" />

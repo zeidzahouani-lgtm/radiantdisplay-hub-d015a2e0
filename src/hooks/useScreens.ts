@@ -76,7 +76,7 @@ export function useScreens() {
   });
 
   const updateScreen = useMutation({
-    mutationFn: async ({ id, ...updates }: { id: string; name?: string; slug?: string; orientation?: string; current_media_id?: string | null; status?: string; layout_id?: string | null; debug_mode?: number; resolution?: string }) => {
+    mutationFn: async ({ id, ...updates }: { id: string; name?: string; slug?: string; orientation?: string; current_media_id?: string | null; status?: string; layout_id?: string | null; playlist_id?: string | null; program_id?: string | null; debug_mode?: number; resolution?: string }) => {
       const { error } = await supabase.from("screens").update(updates).eq("id", id);
       if (error) throw error;
     },

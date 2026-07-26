@@ -1363,7 +1363,8 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
   let supabaseUrlOverride = "";
   let supabaseAnonOverride = "";
   let supabaseProjectIdOverride = "";
-  const deploymentDeadline = Date.now() + 13 * 60 * 1000;
+  // L'edge function est coupée par le runtime après ~400s : on sort proprement avant.
+  const deploymentDeadline = Date.now() + 5.5 * 60 * 1000;
   const ensureDeploymentBudget = async (nextStep: string) => {
     if (Date.now() <= deploymentDeadline) return;
     await log(`⚠ Délai maximum atteint avant: ${nextStep}`);

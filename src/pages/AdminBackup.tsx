@@ -2174,6 +2174,16 @@ To rebuild manually: docker compose up -d --build
                 </Button>
                 <Button
                   type="button"
+                  variant="outline"
+                  className="gap-2"
+                  onClick={handleBuildStatus}
+                  disabled={sshDeploying || !sshHost || !sshUser || !sshPassword}
+                  title="Le build Docker continue sur le serveur même après la fin de la session : ce bouton suit sa progression et finalise la vérification."
+                >
+                  <RefreshCw className="h-4 w-4" />Vérifier le build
+                </Button>
+                <Button
+                  type="button"
                   variant="secondary"
                   className="gap-2"
                   onClick={handleApplyMigrations}

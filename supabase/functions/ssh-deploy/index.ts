@@ -2441,6 +2441,58 @@ async function runDiagnoseServer(
   }
 }
 
+// ===== Suivre / finaliser un build détaché lancé par un déploiement =====
+async function runBuildStatus(body: DeployBody, log: (m: string) => Promise<void> | void) {
+  const port = body.port ?? 22;
+  const remoteDir = body.remote_dir || "/opt/screenflow";
+  const stateDir = `${remoteDir}/.build`;
+  const repoDir = `${remoteDir}/repo`;
+  await log(`→ Connexion SSH ${body.username}@${body.host}:${port}…`);
+  const conn = await ssh({ host: body.host, port, username: body.username, password: body.password });
+  await log("✓ SSH connecté");
+  try {
+    const exists = (await exec(conn, `[ -d ${stateDir} ] && echo OK || echo NO`)).stdout.includes("OK");
+    if (!exists) {
+      await log("ℹ Aucun build détaché trouvé — lancez d'abord un déploiement ou une mise à jour rapide.");
+      const psNone = await exec(conn, `cd ${repoDir} && (docker compose ps || docker-compose ps) 2>&1 | tail -20`);
+      await log(psNone.stdout);
+      const r0 = { action: "build_status", found: false, running: false, ok: false, ps: psNone.stdout.trim() };
+      (globalThis as any).__lastDeployResult = r0;
+      return r0;
+    }
+    await log("→ Suivi du build en cours sur le serveur…");
+    const res = await pollDetachedCompose(conn, stateDir, Date.now() + 4 * 60 * 1000, log);
+    if (!res.done) {
+      await log("⏳ Build toujours en cours — recliquez sur « Vérifier le build » dans quelques minutes.");
+      const rPending = { action: "build_status", found: true, running: true, ok: false, tail: res.tail.slice(-2000) };
+      (globalThis as any).__lastDeployResult = rPending;
+      return rPending;
+    }
+    await log(res.tail.slice(-2000));
+    const ok = res.code === 0;
+    await log(ok ? "✓ Build terminé avec succès" : `✗ Build échoué (code ${res.code})`);
+    const ps = await exec(conn, `cd ${repoDir} && (docker compose ps || docker-compose ps) 2>&1 | tail -20`);
+    await log(ps.stdout);
+    const appPort = body.app_port || "8080";
+    const http = await exec(conn, `curl -s -o /dev/null -w "%{http_code}" --max-time 10 http://127.0.0.1:${appPort} || echo FAIL`);
+    await log(`  • App HTTP 127.0.0.1:${appPort} → ${http.stdout.trim()}`);
+    const result = {
+      action: "build_status",
+      found: true,
+      running: false,
+      ok,
+      code: res.code,
+      ps: ps.stdout.trim(),
+      app_http: http.stdout.trim(),
+    };
+    (globalThis as any).__lastDeployResult = result;
+    return result;
+  } finally {
+    try { conn.end(); } catch (_) {}
+  }
+}
+
+
 // ===== Restart whole docker stack (web + supabase) =====
 async function runRestartStack(body: DeployBody, log: (m: string) => Promise<void> | void) {
   const port = body.port ?? 22;

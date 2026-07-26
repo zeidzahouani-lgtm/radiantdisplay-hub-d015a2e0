@@ -1210,6 +1210,14 @@ To rebuild manually: docker compose up -d --build
     });
   };
 
+  const handleBuildStatus = () => {
+    runSshAction("build_status", {}, {
+      initialLog: "🔍 Vérification du build en cours sur le serveur…",
+      successMessage: "Vérification du build terminée ✓",
+    });
+  };
+
+
   // ===== Network management =====
   const [networkInfo, setNetworkInfo] = useState<any>(null);
   const [networkConfig, setNetworkConfig] = useState<any>(null);
@@ -2163,6 +2171,16 @@ To rebuild manually: docker compose up -d --build
                   title="Tire les derniers commits, applique les migrations manquantes, synchronise les fonctions backend et reconstruit uniquement le conteneur web — sans toucher à Supabase ni reinstaller la stack."
                 >
                   <Rocket className="h-4 w-4" />Mise à jour rapide
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="gap-2"
+                  onClick={handleBuildStatus}
+                  disabled={sshDeploying || !sshHost || !sshUser || !sshPassword}
+                  title="Le build Docker continue sur le serveur même après la fin de la session : ce bouton suit sa progression et finalise la vérification."
+                >
+                  <RefreshCw className="h-4 w-4" />Vérifier le build
                 </Button>
                 <Button
                   type="button"

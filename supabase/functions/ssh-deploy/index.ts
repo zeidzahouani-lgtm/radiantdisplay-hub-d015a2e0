@@ -14,7 +14,7 @@ const corsHeaders = {
 
 interface DeployBody {
   // Action: "deploy" (default), "reset_admin_password", or "check_admin_status" (read-only diagnostic)
-  action?: "deploy" | "reset_admin_password" | "check_admin_status" | "repair_local_writes" | "repair_local_api_url" | "diagnose_server" | "restart_stack" | "repair_storage_buckets" | "repair_realtime" | "apply_local_migrations" | "quick_update" | "network_inspect" | "network_recreate" | "network_set_subnet" | "network_set_hostname" | "network_get_config" | "network_set_container_ip";
+  action?: "deploy" | "reset_admin_password" | "check_admin_status" | "repair_local_writes" | "repair_local_api_url" | "diagnose_server" | "restart_stack" | "repair_storage_buckets" | "repair_realtime" | "apply_local_migrations" | "quick_update" | "build_status" | "network_inspect" | "network_recreate" | "network_set_subnet" | "network_set_hostname" | "network_get_config" | "network_set_container_ip";
   // Custom Docker network subnet (CIDR), e.g. 172.28.0.0/16
   network_subnet?: string;
   network_gateway?: string;
@@ -126,6 +126,51 @@ function exec(conn: Client, cmd: string): Promise<{ code: number; stdout: string
         .stderr.on("data", (d: Buffer) => (stderr += d.toString()));
     });
   });
+}
+
+/**
+ * Lance `docker compose up -d --build` en arrière-plan sur le serveur (nohup),
+ * pour que le build ne soit plus lié à la durée de vie de l'edge function.
+ */
+async function startDetachedCompose(conn: Client, repoDir: string, stateDir: string) {
+  const script = `${stateDir}/build.sh`;
+  const cmd =
+    `mkdir -p ${stateDir} && ` +
+    `printf '%s\\n' '#!/usr/bin/env bash' 'set -o pipefail' ` +
+    `'cd ${repoDir} || exit 1' ` +
+    `'(docker compose up -d --build || docker-compose up -d --build) > ${stateDir}/build.log 2>&1' ` +
+    `'echo $? > ${stateDir}/build.code' > ${script} && ` +
+    `chmod +x ${script} && rm -f ${stateDir}/build.code && : > ${stateDir}/build.log && ` +
+    `(setsid nohup ${script} >/dev/null 2>&1 & ) && echo STARTED`;
+  const res = await exec(conn, cmd);
+  if (!res.stdout.includes("STARTED")) {
+    throw new Error("Impossible de lancer le build en arrière-plan: " + (res.stderr || res.stdout).slice(-300));
+  }
+}
+
+async function pollDetachedCompose(
+  conn: Client,
+  stateDir: string,
+  deadlineMs: number,
+  log: (m: string) => Promise<void> | void,
+): Promise<{ done: boolean; code: number | null; tail: string }> {
+  let lastTail = "";
+  while (Date.now() < deadlineMs) {
+    const res = await exec(
+      conn,
+      `if [ -f ${stateDir}/build.code ]; then echo "DONE:$(cat ${stateDir}/build.code)"; else echo RUNNING; fi; echo '---'; tail -n 6 ${stateDir}/build.log 2>/dev/null`,
+    );
+    const out = res.stdout || "";
+    const [head, ...rest] = out.split("---");
+    lastTail = rest.join("---").trim();
+    if (head.includes("DONE:")) {
+      const code = parseInt(head.split("DONE:")[1].trim(), 10);
+      return { done: true, code: Number.isNaN(code) ? 0 : code, tail: lastTail };
+    }
+    if (lastTail) await log("   … " + lastTail.split("\n").slice(-2).join(" | ").slice(0, 200));
+    await new Promise((r) => setTimeout(r, 8000));
+  }
+  return { done: false, code: null, tail: lastTail };
 }
 
 function uploadFile(conn: Client, remotePath: string, content: Buffer): Promise<void> {
@@ -1153,6 +1198,8 @@ async function runDeploymentJob(
       await runRepairRealtime(body, log);
     } else if (body.action === "apply_local_migrations") {
       directResult = await runApplyLocalMigrations(body, log);
+    } else if (body.action === "build_status") {
+      directResult = await runBuildStatus(body, log);
     } else if (body.action === "quick_update") {
       directResult = await runQuickUpdate(body, log);
     } else if (body.action === "network_inspect") {
@@ -1255,7 +1302,9 @@ Deno.serve(async (req) => {
                       ? "Réparation Realtime lancée en arrière-plan."
                       : action === "apply_local_migrations"
                         ? "Application des migrations locales lancée en arrière-plan."
-                        : action === "quick_update"
+                        : action === "build_status"
+                          ? "Vérification du build en cours lancée en arrière-plan."
+                          : action === "quick_update"
                           ? "Mise à jour rapide lancée en arrière-plan (git pull + migrations + rebuild web)."
                           : action === "network_inspect"
                             ? "Inspection du réseau Docker lancée en arrière-plan."
@@ -1318,7 +1367,8 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
   let supabaseUrlOverride = "";
   let supabaseAnonOverride = "";
   let supabaseProjectIdOverride = "";
-  const deploymentDeadline = Date.now() + 13 * 60 * 1000;
+  // L'edge function est coupée par le runtime après ~400s : on sort proprement avant.
+  const deploymentDeadline = Date.now() + 5.5 * 60 * 1000;
   const ensureDeploymentBudget = async (nextStep: string) => {
     if (Date.now() <= deploymentDeadline) return;
     await log(`⚠ Délai maximum atteint avant: ${nextStep}`);
@@ -1819,15 +1869,22 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
         log("✓ Certificat SSL généré");
       }
 
-      log("→ Building & starting containers (docker compose up -d --build)…");
-      const composeCmd = `cd ${remoteDir}/repo && (docker compose up -d --build || docker-compose up -d --build) 2>&1`;
-      const up = await exec(conn, composeCmd);
-      log(up.stdout.slice(-3000));
-      if (up.code !== 0) {
-        log("⚠ Compose stderr: " + up.stderr.slice(-1500));
-        throw new Error("docker compose failed");
+      await log("→ Build des conteneurs lancé en arrière-plan sur le serveur (docker compose up -d --build)…");
+      const buildStateDir = `${remoteDir}/.build`;
+      await startDetachedCompose(conn, `${remoteDir}/repo`, buildStateDir);
+      await log("✓ Build détaché démarré — il continue même si cette session se termine.");
+      const buildDeadline = Math.min(deploymentDeadline, Date.now() + 4 * 60 * 1000);
+      const buildResult = await pollDetachedCompose(conn, buildStateDir, buildDeadline, log);
+      if (!buildResult.done) {
+        throw new Error(
+          "Build toujours en cours sur le serveur (il n'a PAS été interrompu). " +
+          "Cliquez sur « Vérifier le build » dans /admin/backup pour suivre la fin du build et finaliser la vérification.",
+        );
       }
-      await ensureDeploymentBudget("vérification finale des conteneurs");
+      await log(buildResult.tail.slice(-2000));
+      if (buildResult.code !== 0) {
+        throw new Error("docker compose failed (code " + buildResult.code + ") — voir " + buildStateDir + "/build.log sur le serveur");
+      }
     await log("✓ Containers started");
 
     const ps = await exec(conn, `cd ${remoteDir}/repo && (docker compose ps || docker-compose ps)`);
@@ -2388,6 +2445,58 @@ async function runDiagnoseServer(
   }
 }
 
+// ===== Suivre / finaliser un build détaché lancé par un déploiement =====
+async function runBuildStatus(body: DeployBody, log: (m: string) => Promise<void> | void) {
+  const port = body.port ?? 22;
+  const remoteDir = body.remote_dir || "/opt/screenflow";
+  const stateDir = `${remoteDir}/.build`;
+  const repoDir = `${remoteDir}/repo`;
+  await log(`→ Connexion SSH ${body.username}@${body.host}:${port}…`);
+  const conn = await ssh({ host: body.host, port, username: body.username, password: body.password });
+  await log("✓ SSH connecté");
+  try {
+    const exists = (await exec(conn, `[ -d ${stateDir} ] && echo OK || echo NO`)).stdout.includes("OK");
+    if (!exists) {
+      await log("ℹ Aucun build détaché trouvé — lancez d'abord un déploiement ou une mise à jour rapide.");
+      const psNone = await exec(conn, `cd ${repoDir} && (docker compose ps || docker-compose ps) 2>&1 | tail -20`);
+      await log(psNone.stdout);
+      const r0 = { action: "build_status", found: false, running: false, ok: false, ps: psNone.stdout.trim() };
+      (globalThis as any).__lastDeployResult = r0;
+      return r0;
+    }
+    await log("→ Suivi du build en cours sur le serveur…");
+    const res = await pollDetachedCompose(conn, stateDir, Date.now() + 4 * 60 * 1000, log);
+    if (!res.done) {
+      await log("⏳ Build toujours en cours — recliquez sur « Vérifier le build » dans quelques minutes.");
+      const rPending = { action: "build_status", found: true, running: true, ok: false, tail: res.tail.slice(-2000) };
+      (globalThis as any).__lastDeployResult = rPending;
+      return rPending;
+    }
+    await log(res.tail.slice(-2000));
+    const ok = res.code === 0;
+    await log(ok ? "✓ Build terminé avec succès" : `✗ Build échoué (code ${res.code})`);
+    const ps = await exec(conn, `cd ${repoDir} && (docker compose ps || docker-compose ps) 2>&1 | tail -20`);
+    await log(ps.stdout);
+    const appPort = body.app_port || "8080";
+    const http = await exec(conn, `curl -s -o /dev/null -w "%{http_code}" --max-time 10 http://127.0.0.1:${appPort} || echo FAIL`);
+    await log(`  • App HTTP 127.0.0.1:${appPort} → ${http.stdout.trim()}`);
+    const result = {
+      action: "build_status",
+      found: true,
+      running: false,
+      ok,
+      code: res.code,
+      ps: ps.stdout.trim(),
+      app_http: http.stdout.trim(),
+    };
+    (globalThis as any).__lastDeployResult = result;
+    return result;
+  } finally {
+    try { conn.end(); } catch (_) {}
+  }
+}
+
+
 // ===== Restart whole docker stack (web + supabase) =====
 async function runRestartStack(body: DeployBody, log: (m: string) => Promise<void> | void) {
   const port = body.port ?? 22;
@@ -2706,11 +2815,18 @@ async function runQuickUpdate(body: DeployBody, log: (m: string) => Promise<void
     // ===== 4. Rebuild only the web container =====
     const webPresent = (await exec(conn, `[ -f ${repoDir}/docker-compose.yml ] && echo OK || echo NO`)).stdout.includes("OK");
     if (webPresent) {
-      await log("→ Rebuild du conteneur web (docker compose up -d --build web)…");
-      const r = await exec(conn, `cd ${repoDir} && (docker compose up -d --build web || docker-compose up -d --build web) 2>&1 | tail -80`);
-      await log(r.stdout.split("\n").slice(-15).join("\n"));
-      summary.web_rebuild.ok = r.code === 0;
-      if (r.code === 0) await log("✓ Conteneur web reconstruit et redémarré");
+      await log("→ Rebuild du conteneur web en arrière-plan (docker compose up -d --build)…");
+      const qStateDir = `${remoteDir}/.build`;
+      await startDetachedCompose(conn, repoDir, qStateDir);
+      const qRes = await pollDetachedCompose(conn, qStateDir, Date.now() + 3.5 * 60 * 1000, log);
+      if (!qRes.done) {
+        await log("⏳ Rebuild toujours en cours — cliquez sur « Vérifier le build » pour suivre la fin.");
+        summary.web_rebuild.ok = false;
+      } else {
+        await log(qRes.tail.slice(-1500));
+        summary.web_rebuild.ok = qRes.code === 0;
+        if (qRes.code === 0) await log("✓ Conteneur web reconstruit et redémarré");
+      }
     } else {
       await log("ℹ Aucun docker-compose.yml d'application — étape rebuild ignorée.");
     }

@@ -1864,15 +1864,22 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
         log("✓ Certificat SSL généré");
       }
 
-      log("→ Building & starting containers (docker compose up -d --build)…");
-      const composeCmd = `cd ${remoteDir}/repo && (docker compose up -d --build || docker-compose up -d --build) 2>&1`;
-      const up = await exec(conn, composeCmd);
-      log(up.stdout.slice(-3000));
-      if (up.code !== 0) {
-        log("⚠ Compose stderr: " + up.stderr.slice(-1500));
-        throw new Error("docker compose failed");
+      await log("→ Build des conteneurs lancé en arrière-plan sur le serveur (docker compose up -d --build)…");
+      const buildStateDir = `${remoteDir}/.build`;
+      await startDetachedCompose(conn, `${remoteDir}/repo`, buildStateDir);
+      await log("✓ Build détaché démarré — il continue même si cette session se termine.");
+      const buildDeadline = Math.min(deploymentDeadline, Date.now() + 4 * 60 * 1000);
+      const buildResult = await pollDetachedCompose(conn, buildStateDir, buildDeadline, log);
+      if (!buildResult.done) {
+        throw new Error(
+          "Build toujours en cours sur le serveur (il n'a PAS été interrompu). " +
+          "Cliquez sur « Vérifier le build » dans /admin/backup pour suivre la fin du build et finaliser la vérification.",
+        );
       }
-      await ensureDeploymentBudget("vérification finale des conteneurs");
+      await log(buildResult.tail.slice(-2000));
+      if (buildResult.code !== 0) {
+        throw new Error("docker compose failed (code " + buildResult.code + ") — voir " + buildStateDir + "/build.log sur le serveur");
+      }
     await log("✓ Containers started");
 
     const ps = await exec(conn, `cd ${remoteDir}/repo && (docker compose ps || docker-compose ps)`);

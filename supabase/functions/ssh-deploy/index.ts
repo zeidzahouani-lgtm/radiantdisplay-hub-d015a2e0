@@ -2815,11 +2815,18 @@ async function runQuickUpdate(body: DeployBody, log: (m: string) => Promise<void
     // ===== 4. Rebuild only the web container =====
     const webPresent = (await exec(conn, `[ -f ${repoDir}/docker-compose.yml ] && echo OK || echo NO`)).stdout.includes("OK");
     if (webPresent) {
-      await log("→ Rebuild du conteneur web (docker compose up -d --build web)…");
-      const r = await exec(conn, `cd ${repoDir} && (docker compose up -d --build web || docker-compose up -d --build web) 2>&1 | tail -80`);
-      await log(r.stdout.split("\n").slice(-15).join("\n"));
-      summary.web_rebuild.ok = r.code === 0;
-      if (r.code === 0) await log("✓ Conteneur web reconstruit et redémarré");
+      await log("→ Rebuild du conteneur web en arrière-plan (docker compose up -d --build)…");
+      const qStateDir = `${remoteDir}/.build`;
+      await startDetachedCompose(conn, repoDir, qStateDir);
+      const qRes = await pollDetachedCompose(conn, qStateDir, Date.now() + 3.5 * 60 * 1000, log);
+      if (!qRes.done) {
+        await log("⏳ Rebuild toujours en cours — cliquez sur « Vérifier le build » pour suivre la fin.");
+        summary.web_rebuild.ok = false;
+      } else {
+        await log(qRes.tail.slice(-1500));
+        summary.web_rebuild.ok = qRes.code === 0;
+        if (qRes.code === 0) await log("✓ Conteneur web reconstruit et redémarré");
+      }
     } else {
       await log("ℹ Aucun docker-compose.yml d'application — étape rebuild ignorée.");
     }

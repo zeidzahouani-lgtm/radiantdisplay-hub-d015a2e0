@@ -128,6 +128,51 @@ function exec(conn: Client, cmd: string): Promise<{ code: number; stdout: string
   });
 }
 
+/**
+ * Lance `docker compose up -d --build` en arrière-plan sur le serveur (nohup),
+ * pour que le build ne soit plus lié à la durée de vie de l'edge function.
+ */
+async function startDetachedCompose(conn: Client, repoDir: string, stateDir: string) {
+  const script = `${stateDir}/build.sh`;
+  const cmd =
+    `mkdir -p ${stateDir} && ` +
+    `printf '%s\\n' '#!/usr/bin/env bash' 'set -o pipefail' ` +
+    `'cd ${repoDir} || exit 1' ` +
+    `'(docker compose up -d --build || docker-compose up -d --build) > ${stateDir}/build.log 2>&1' ` +
+    `'echo $? > ${stateDir}/build.code' > ${script} && ` +
+    `chmod +x ${script} && rm -f ${stateDir}/build.code && : > ${stateDir}/build.log && ` +
+    `(setsid nohup ${script} >/dev/null 2>&1 & ) && echo STARTED`;
+  const res = await exec(conn, cmd);
+  if (!res.stdout.includes("STARTED")) {
+    throw new Error("Impossible de lancer le build en arrière-plan: " + (res.stderr || res.stdout).slice(-300));
+  }
+}
+
+async function pollDetachedCompose(
+  conn: Client,
+  stateDir: string,
+  deadlineMs: number,
+  log: (m: string) => Promise<void> | void,
+): Promise<{ done: boolean; code: number | null; tail: string }> {
+  let lastTail = "";
+  while (Date.now() < deadlineMs) {
+    const res = await exec(
+      conn,
+      `if [ -f ${stateDir}/build.code ]; then echo "DONE:$(cat ${stateDir}/build.code)"; else echo RUNNING; fi; echo '---'; tail -n 6 ${stateDir}/build.log 2>/dev/null`,
+    );
+    const out = res.stdout || "";
+    const [head, ...rest] = out.split("---");
+    lastTail = rest.join("---").trim();
+    if (head.includes("DONE:")) {
+      const code = parseInt(head.split("DONE:")[1].trim(), 10);
+      return { done: true, code: Number.isNaN(code) ? 0 : code, tail: lastTail };
+    }
+    if (lastTail) await log("   … " + lastTail.split("\n").slice(-2).join(" | ").slice(0, 200));
+    await new Promise((r) => setTimeout(r, 8000));
+  }
+  return { done: false, code: null, tail: lastTail };
+}
+
 function uploadFile(conn: Client, remotePath: string, content: Buffer): Promise<void> {
   return new Promise((resolve, reject) => {
     conn.sftp((err: any, sftp: any) => {

@@ -14,7 +14,7 @@ const corsHeaders = {
 
 interface DeployBody {
   // Action: "deploy" (default), "reset_admin_password", or "check_admin_status" (read-only diagnostic)
-  action?: "deploy" | "reset_admin_password" | "check_admin_status" | "repair_local_writes" | "repair_local_api_url" | "diagnose_server" | "restart_stack" | "repair_storage_buckets" | "repair_realtime" | "apply_local_migrations" | "quick_update" | "network_inspect" | "network_recreate" | "network_set_subnet" | "network_set_hostname" | "network_get_config" | "network_set_container_ip";
+  action?: "deploy" | "reset_admin_password" | "check_admin_status" | "repair_local_writes" | "repair_local_api_url" | "diagnose_server" | "restart_stack" | "repair_storage_buckets" | "repair_realtime" | "apply_local_migrations" | "quick_update" | "build_status" | "network_inspect" | "network_recreate" | "network_set_subnet" | "network_set_hostname" | "network_get_config" | "network_set_container_ip";
   // Custom Docker network subnet (CIDR), e.g. 172.28.0.0/16
   network_subnet?: string;
   network_gateway?: string;
@@ -1198,6 +1198,8 @@ async function runDeploymentJob(
       await runRepairRealtime(body, log);
     } else if (body.action === "apply_local_migrations") {
       directResult = await runApplyLocalMigrations(body, log);
+    } else if (body.action === "build_status") {
+      directResult = await runBuildStatus(body, log);
     } else if (body.action === "quick_update") {
       directResult = await runQuickUpdate(body, log);
     } else if (body.action === "network_inspect") {
@@ -1300,7 +1302,9 @@ Deno.serve(async (req) => {
                       ? "Réparation Realtime lancée en arrière-plan."
                       : action === "apply_local_migrations"
                         ? "Application des migrations locales lancée en arrière-plan."
-                        : action === "quick_update"
+                        : action === "build_status"
+                          ? "Vérification du build en cours lancée en arrière-plan."
+                          : action === "quick_update"
                           ? "Mise à jour rapide lancée en arrière-plan (git pull + migrations + rebuild web)."
                           : action === "network_inspect"
                             ? "Inspection du réseau Docker lancée en arrière-plan."

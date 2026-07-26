@@ -1210,6 +1210,14 @@ To rebuild manually: docker compose up -d --build
     });
   };
 
+  const handleBuildStatus = () => {
+    runSshAction("build_status", {}, {
+      initialLog: "🔍 Vérification du build en cours sur le serveur…",
+      successMessage: "Vérification du build terminée ✓",
+    });
+  };
+
+
   // ===== Network management =====
   const [networkInfo, setNetworkInfo] = useState<any>(null);
   const [networkConfig, setNetworkConfig] = useState<any>(null);

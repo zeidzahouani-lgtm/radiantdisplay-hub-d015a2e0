@@ -1145,6 +1145,12 @@ To rebuild manually: docker compose up -d --build
       successMessage: "Stack redémarrée ✓",
     });
 
+  const handleRepairWebContainer = () =>
+    runSshAction("repair_web_container", {}, {
+      initialLog: "🛠 Réparation du conteneur web (diagnostic + rebuild)…",
+      successMessage: "Conteneur web réparé ✓",
+    });
+
   const handleRepairBuckets = () =>
     runSshAction("repair_storage_buckets", {}, {
       initialLog: "🪣 Réparation des buckets Storage…",
@@ -1342,6 +1348,7 @@ To rebuild manually: docker compose up -d --build
   const fixActionMap: Record<string, { label: string; run: () => void }> = {
     quick_update: { label: "Mise à jour rapide", run: handleQuickUpdate },
     restart_stack: { label: "Redémarrer la stack", run: handleRestartStack },
+    repair_web_container: { label: "Réparer le conteneur web", run: handleRepairWebContainer },
     repair_local_writes: { label: "Réparer upload/écrans", run: handleRepairLocalWrites },
     repair_local_api_url: { label: "Corriger l'URL API", run: handleRepairApiUrl },
     repair_storage_buckets: { label: "Réparer buckets Storage", run: handleRepairBuckets },

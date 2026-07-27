@@ -2191,6 +2191,16 @@ To rebuild manually: docker compose up -d --build
                 </Button>
                 <Button
                   type="button"
+                  variant="outline"
+                  className="gap-2"
+                  onClick={handleRepairWebContainer}
+                  disabled={sshDeploying || !sshHost || !sshUser || !sshPassword}
+                  title="Diagnostique pourquoi le conteneur web est arrêté, le reconstruit, puis vérifie le proxy /storage/v1 utilisé pour les uploads."
+                >
+                  <RefreshCw className="h-4 w-4" />Réparer le conteneur web
+                </Button>
+                <Button
+                  type="button"
                   variant="secondary"
                   className="gap-2"
                   onClick={handleApplyMigrations}

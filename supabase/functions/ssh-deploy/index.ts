@@ -1192,6 +1192,8 @@ async function runDeploymentJob(
       directResult = await runDiagnoseServer(body, log, persist);
     } else if (body.action === "restart_stack") {
       await runRestartStack(body, log);
+    } else if (body.action === "repair_web_container") {
+      directResult = await runRepairWebContainer(body, log);
     } else if (body.action === "repair_storage_buckets") {
       await runRepairStorageBuckets(body, log);
     } else if (body.action === "repair_realtime") {
@@ -2360,7 +2362,7 @@ async function runDiagnoseServer(
     const psLines = ps.stdout.split("\n").filter(Boolean);
     const has = (re: RegExp) => psLines.some((l) => re.test(l));
     const webOk = has(/screenflow.*web|screenflow-web|^web\|/i) || has(/nginx/i);
-    add({ key: "container_web", label: "Conteneur web (frontend)", ok: webOk, suggested_action: webOk ? undefined : "restart_stack" });
+    add({ key: "container_web", label: "Conteneur web (frontend)", ok: webOk, suggested_action: webOk ? undefined : "repair_web_container" });
 
     if (supaPresent) {
       const dbOk = has(/supabase-db|^db\|/i);
@@ -3022,10 +3024,10 @@ async function runNetworkRecreate(body: DeployBody, log: (m: string) => Promise<
       await log("→ Arrêt de la stack Supabase…");
       await exec(conn, `cd ${supaDir} && (docker compose down || docker-compose down) 2>&1`);
     }
-    const repoPresent = (await exec(conn, `[ -f ${remoteDir}/docker-compose.yml ] && echo OK || echo NO`)).stdout.includes("OK");
+    const repoPresent = (await exec(conn, `[ -f ${remoteDir}/repo/docker-compose.yml ] && echo OK || echo NO`)).stdout.includes("OK");
     if (repoPresent) {
       await log("→ Arrêt de la stack web…");
-      await exec(conn, `cd ${remoteDir} && (docker compose down || docker-compose down) 2>&1`);
+      await exec(conn, `cd ${remoteDir}/repo && (docker compose down || docker-compose down) 2>&1`);
     }
     await log("→ Suppression des réseaux orphelins…");
     await exec(conn, "docker network prune -f 2>&1");
@@ -3036,7 +3038,7 @@ async function runNetworkRecreate(body: DeployBody, log: (m: string) => Promise<
     }
     if (repoPresent) {
       await log("→ Redémarrage web…");
-      const r2 = await exec(conn, `cd ${remoteDir} && (docker compose up -d || docker-compose up -d) 2>&1`);
+      const r2 = await exec(conn, `cd ${remoteDir}/repo && (docker compose up -d || docker-compose up -d) 2>&1`);
       await log(r2.stdout.split("\n").slice(-10).join("\n"));
     }
     await log("✓ Réseau Docker recréé");

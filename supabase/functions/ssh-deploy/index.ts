@@ -2514,11 +2514,15 @@ async function runRestartStack(body: DeployBody, log: (m: string) => Promise<voi
     } else {
       await log("ℹ Aucune stack Supabase locale détectée — étape ignorée.");
     }
-    const repoPresent = (await exec(conn, `[ -f ${remoteDir}/docker-compose.yml ] && echo OK || echo NO`)).stdout.includes("OK");
+    const repoDir = `${remoteDir}/repo`;
+    const repoPresent = (await exec(conn, `[ -f ${repoDir}/docker-compose.yml ] && echo OK || echo NO`)).stdout.includes("OK");
     if (repoPresent) {
       await log("→ Redémarrage du conteneur web…");
-      const r2 = await exec(conn, `cd ${remoteDir} && (docker compose restart web || docker-compose restart web) 2>&1`);
+      // `restart` ne relance pas un conteneur absent : on utilise up -d puis restart.
+      const r2 = await exec(conn, `cd ${repoDir} && ((docker compose up -d web && docker compose restart web) || (docker-compose up -d web && docker-compose restart web)) 2>&1`);
       await log(r2.stdout.split("\n").slice(-15).join("\n"));
+    } else {
+      await log(`ℹ Aucun docker-compose.yml applicatif dans ${repoDir} — conteneur web non redémarré.`);
     }
     await log("✓ Stack redémarrée");
     (globalThis as any).__lastDeployResult = { action: "restart_stack", ok: true };
@@ -2526,6 +2530,96 @@ async function runRestartStack(body: DeployBody, log: (m: string) => Promise<voi
     try { conn.end(); } catch (_) {}
   }
 }
+
+// ===== Repair the web (frontend) container: diagnose why it is down, rebuild and verify uploads proxy =====
+async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promise<void> | void) {
+  const port = body.port ?? 22;
+  const remoteDir = body.remote_dir || "/opt/screenflow";
+  const supaDir = `${remoteDir}/supabase`;
+  const repoDir = `${remoteDir}/repo`;
+  await log(`→ Connexion SSH ${body.username}@${body.host}:${port}…`);
+  const conn = await ssh({ host: body.host, port, username: body.username, password: body.password });
+  await log("✓ SSH connecté");
+  const result: any = { action: "repair_web_container", ok: false, cause: null, running: false, upload_proxy_ok: false };
+  try {
+    const present = (await exec(conn, `[ -f ${repoDir}/docker-compose.yml ] && echo OK || echo NO`)).stdout.includes("OK");
+    if (!present) {
+      result.cause = `Aucun docker-compose.yml dans ${repoDir}`;
+      throw new Error(`Aucun docker-compose.yml applicatif dans ${repoDir}. Lancez un déploiement complet.`);
+    }
+
+    // 1. Why is it down?
+    await log("→ Analyse de l'état du conteneur web…");
+    const state = await exec(conn, `cd ${repoDir} && (docker compose ps -a || docker-compose ps -a) 2>&1`);
+    await log(state.stdout.split("\n").slice(-15).join("\n"));
+    const lastBuild = await exec(conn, `tail -n 25 ${remoteDir}/.build/build.log 2>/dev/null || true`);
+    if (lastBuild.stdout.trim()) {
+      await log("ℹ Dernières lignes du build précédent :\n" + lastBuild.stdout.slice(-1500));
+      if (/error|ERR!|failed/i.test(lastBuild.stdout)) result.cause = "Build précédent en erreur";
+    }
+    const webLogs = await exec(conn, `cd ${repoDir} && (docker compose logs --tail=25 web || docker-compose logs --tail=25 web) 2>&1 || true`);
+    if (webLogs.stdout.trim()) await log("ℹ Logs conteneur web :\n" + webLogs.stdout.slice(-1200));
+    if (!result.cause && !/Up\s/i.test(state.stdout)) result.cause = "Conteneur web arrêté ou jamais construit";
+
+    // 2. Rebuild (detached so the edge runtime timeout cannot kill it)
+    await log("→ Reconstruction du conteneur web en arrière-plan (docker compose up -d --build)…");
+    const stateDir = `${remoteDir}/.build`;
+    await startDetachedCompose(conn, repoDir, stateDir);
+    const res = await pollDetachedCompose(conn, stateDir, Date.now() + 4 * 60 * 1000, log);
+    if (!res.done) {
+      await log("⏳ Build toujours en cours — cliquez sur « Vérifier le build » dans quelques minutes.");
+      result.cause = result.cause || "Build long en cours";
+      (globalThis as any).__lastDeployResult = result;
+      return result;
+    }
+    await log(res.tail.slice(-1500));
+    if (res.code !== 0) {
+      result.cause = "Échec du build Docker (voir " + stateDir + "/build.log)";
+      throw new Error(result.cause);
+    }
+
+    // 3. Verify container up + nginx proxy for uploads
+    const ps2 = await exec(conn, `cd ${repoDir} && (docker compose ps || docker-compose ps) 2>&1`);
+    result.running = /Up\s|running/i.test(ps2.stdout);
+    await log(ps2.stdout.split("\n").slice(-10).join("\n"));
+
+    const cid = (await exec(conn, `cd ${repoDir} && (docker compose ps -q web || docker-compose ps -q web) 2>/dev/null | head -1`)).stdout.trim();
+    if (cid) {
+      const conf = await exec(conn, `docker exec ${cid} cat /etc/nginx/conf.d/default.conf 2>/dev/null || true`);
+      const hasStorage = /location \/storage\/v1\//.test(conf.stdout);
+      const hasBodySize = /client_max_body_size/.test(conf.stdout);
+      result.upload_proxy_ok = hasStorage && hasBodySize;
+      await log(hasStorage
+        ? `✓ Proxy upload présent dans nginx (/storage/v1/ ${hasBodySize ? "+ client_max_body_size" : "SANS client_max_body_size"})`
+        : "✗ Le proxy /storage/v1/ est absent de la config nginx du conteneur — les uploads échoueront.");
+      const gw = await exec(conn, `docker exec ${cid} sh -c 'getent hosts host.docker.internal || true' 2>&1`);
+      result.host_gateway_ok = !!gw.stdout.trim();
+      await log(result.host_gateway_ok
+        ? `✓ host.docker.internal résolu (${gw.stdout.trim().split(/\s+/)[0]})`
+        : "✗ host.docker.internal non résolu dans le conteneur web — le proxy vers Kong/Storage ne peut pas fonctionner.");
+      const up = await exec(conn, `docker exec ${cid} sh -c 'wget -q -S -O /dev/null http://host.docker.internal:8000/storage/v1/bucket 2>&1 | head -3' || true`);
+      if (up.stdout.trim()) await log("ℹ Test Storage depuis le conteneur web : " + up.stdout.trim().replace(/\s+/g, " ").slice(0, 200));
+    }
+
+    // 4. Make sure storage service + policies/buckets are healthy (uploads)
+    const supaPresent = (await exec(conn, `[ -f ${supaDir}/docker-compose.yml ] && echo OK || echo NO`)).stdout.includes("OK");
+    if (supaPresent) {
+      await log("→ Vérification des services Storage/Kong…");
+      await exec(conn, `cd ${supaDir} && (docker compose up -d db rest storage kong 2>&1 || true)`);
+      await applyLocalDashboardWriteHotfix(conn, supaDir, log);
+    }
+
+    result.ok = result.running;
+    await log(result.ok
+      ? "✓ Conteneur web reconstruit et démarré. Rechargez l'application puis retestez un upload."
+      : "⚠ Le conteneur web ne tourne toujours pas — consultez les logs ci-dessus.");
+    (globalThis as any).__lastDeployResult = result;
+    return result;
+  } finally {
+    try { conn.end(); } catch (_) {}
+  }
+}
+
 
 // ===== Repair / re-create default Storage buckets (uploads, media) =====
 async function runRepairStorageBuckets(body: DeployBody, log: (m: string) => Promise<void> | void) {

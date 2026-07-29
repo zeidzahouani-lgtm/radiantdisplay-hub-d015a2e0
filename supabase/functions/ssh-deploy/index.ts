@@ -706,9 +706,13 @@ FOR ALL TO anon, authenticated
 USING (true)
 WITH CHECK (true);
 
-INSERT INTO storage.buckets (id, name, public)
-VALUES ('media', 'media', true)
-ON CONFLICT (id) DO UPDATE SET public = true;
+INSERT INTO storage.buckets (id, name, public, file_size_limit)
+VALUES ('media', 'media', true, 1073741824)
+ON CONFLICT (id) DO UPDATE SET public = true, file_size_limit = 1073741824;
+
+INSERT INTO storage.buckets (id, name, public, file_size_limit)
+VALUES ('uploads', 'uploads', true, 1073741824)
+ON CONFLICT (id) DO UPDATE SET public = true, file_size_limit = 1073741824;
 
 DROP POLICY IF EXISTS "Local dashboard can manage screens" ON public.screens;
 CREATE POLICY "Local dashboard can manage screens" ON public.screens
@@ -759,44 +763,44 @@ WITH CHECK (public.has_role(auth.uid(), 'admin'::public.app_role));
 DROP POLICY IF EXISTS "Local dashboard can read media files" ON storage.objects;
 CREATE POLICY "Local dashboard can read media files" ON storage.objects
 FOR SELECT TO anon, authenticated
-USING (bucket_id = 'media');
+USING (bucket_id IN ('media','uploads'));
 
 DROP POLICY IF EXISTS "Local dashboard can upload media files" ON storage.objects;
 CREATE POLICY "Local dashboard can upload media files" ON storage.objects
 FOR INSERT TO anon, authenticated
-WITH CHECK (bucket_id = 'media');
+WITH CHECK (bucket_id IN ('media','uploads'));
 
 DROP POLICY IF EXISTS "Local dashboard can update media files" ON storage.objects;
 CREATE POLICY "Local dashboard can update media files" ON storage.objects
 FOR UPDATE TO anon, authenticated
-USING (bucket_id = 'media')
-WITH CHECK (bucket_id = 'media');
+USING (bucket_id IN ('media','uploads'))
+WITH CHECK (bucket_id IN ('media','uploads'));
 
 DROP POLICY IF EXISTS "Local dashboard can delete media files" ON storage.objects;
 CREATE POLICY "Local dashboard can delete media files" ON storage.objects
 FOR DELETE TO anon, authenticated
-USING (bucket_id = 'media');
+USING (bucket_id IN ('media','uploads'));
 
 DROP POLICY IF EXISTS "Authenticated users can upload media files" ON storage.objects;
 CREATE POLICY "Authenticated users can upload media files" ON storage.objects
 FOR INSERT TO authenticated
-WITH CHECK (bucket_id = 'media');
+WITH CHECK (bucket_id IN ('media','uploads'));
 
 DROP POLICY IF EXISTS "Authenticated users can update media files" ON storage.objects;
 CREATE POLICY "Authenticated users can update media files" ON storage.objects
 FOR UPDATE TO authenticated
-USING (bucket_id = 'media')
-WITH CHECK (bucket_id = 'media');
+USING (bucket_id IN ('media','uploads'))
+WITH CHECK (bucket_id IN ('media','uploads'));
 
 DROP POLICY IF EXISTS "Authenticated users can delete media files" ON storage.objects;
 CREATE POLICY "Authenticated users can delete media files" ON storage.objects
 FOR DELETE TO authenticated
-USING (bucket_id = 'media');
+USING (bucket_id IN ('media','uploads'));
 
 DROP POLICY IF EXISTS "Public can read media files" ON storage.objects;
 CREATE POLICY "Public can read media files" ON storage.objects
 FOR SELECT TO anon, authenticated
-USING (bucket_id = 'media');
+USING (bucket_id IN ('media','uploads'));
 `;
   const result = await exec(conn, dockerPsql(supaDir, btoa(sql), false));
   const output = `${result.stdout}${result.stderr}`;
@@ -2638,25 +2642,22 @@ async function runRepairStorageBuckets(body: DeployBody, log: (m: string) => Pro
 
     const sql = `
       insert into storage.buckets (id, name, public, file_size_limit)
-      values ('uploads','uploads', true, 524288000)
-      on conflict (id) do update set public=excluded.public;
+      values ('uploads','uploads', true, 1073741824)
+      on conflict (id) do update set public=excluded.public, file_size_limit=excluded.file_size_limit;
       insert into storage.buckets (id, name, public, file_size_limit)
       values ('media','media', true, 1073741824)
-      on conflict (id) do update set public=excluded.public;
-      do $$ begin
-        if not exists (select 1 from pg_policies where schemaname='storage' and tablename='objects' and policyname='public_read_uploads') then
-          create policy public_read_uploads on storage.objects for select using (bucket_id in ('uploads','media'));
-        end if;
-        if not exists (select 1 from pg_policies where schemaname='storage' and tablename='objects' and policyname='auth_write_uploads') then
-          create policy auth_write_uploads on storage.objects for insert to authenticated with check (bucket_id in ('uploads','media'));
-        end if;
-        if not exists (select 1 from pg_policies where schemaname='storage' and tablename='objects' and policyname='auth_update_uploads') then
-          create policy auth_update_uploads on storage.objects for update to authenticated using (bucket_id in ('uploads','media'));
-        end if;
-        if not exists (select 1 from pg_policies where schemaname='storage' and tablename='objects' and policyname='auth_delete_uploads') then
-          create policy auth_delete_uploads on storage.objects for delete to authenticated using (bucket_id in ('uploads','media'));
-        end if;
-      end $$;`;
+      on conflict (id) do update set public=excluded.public, file_size_limit=excluded.file_size_limit;
+      grant usage on schema storage to anon, authenticated;
+      grant select on storage.buckets to anon, authenticated;
+      grant select, insert, update, delete on storage.objects to anon, authenticated;
+      drop policy if exists public_read_uploads on storage.objects;
+      create policy public_read_uploads on storage.objects for select to anon, authenticated using (bucket_id in ('uploads','media'));
+      drop policy if exists auth_write_uploads on storage.objects;
+      create policy auth_write_uploads on storage.objects for insert to anon, authenticated with check (bucket_id in ('uploads','media'));
+      drop policy if exists auth_update_uploads on storage.objects;
+      create policy auth_update_uploads on storage.objects for update to anon, authenticated using (bucket_id in ('uploads','media')) with check (bucket_id in ('uploads','media'));
+      drop policy if exists auth_delete_uploads on storage.objects;
+      create policy auth_delete_uploads on storage.objects for delete to anon, authenticated using (bucket_id in ('uploads','media'));`;
     const out = await exec(conn, dockerPsqlExec(supaDir, sql));
     await log(out.stdout.split("\n").slice(-20).join("\n"));
     await exec(conn, `cd ${supaDir} && (docker compose restart storage || docker-compose restart storage) 2>&1`);

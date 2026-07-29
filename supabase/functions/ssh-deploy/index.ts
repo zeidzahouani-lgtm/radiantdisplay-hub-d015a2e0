@@ -476,7 +476,7 @@ async function handleAnalyticsUnhealthy(conn: Client, supaDir: string, log: (m: 
  * et on commente le service analytics + vector. Idempotent (sentinelle).
  */
 async function patchComposeRemoveAnalytics(conn: Client, supaDir: string, log: (m: string) => Promise<void> | void) {
-  const sentinel = "# LOVABLE_NO_ANALYTICS_PATCH_V2";
+  const sentinel = "# LOVABLE_NO_ANALYTICS_PATCH_V3";
   const composePath = `${supaDir}/docker-compose.yml`;
 
   // 0) Si un patch précédent (V1 regex) a corrompu le fichier, restaurer le backup le plus ancien
@@ -499,11 +499,11 @@ async function patchComposeRemoveAnalytics(conn: Client, supaDir: string, log: (
 
   const check = await exec(conn, `grep -q '${sentinel}' ${composePath} && echo PATCHED || echo TODO`);
   if (/PATCHED/.test(check.stdout)) {
-    await log("✓ docker-compose déjà patché (analytics désactivé).");
+    await log("✓ docker-compose déjà patché (dépendances analytics/vector/studio neutralisées).");
     return;
   }
 
-  await log("→ Patch docker-compose.yml via PyYAML (suppression dépendance analytics)…");
+  await log("→ Patch docker-compose.yml via PyYAML (suppression dépendances bloquantes analytics/vector/studio)…");
   await exec(conn, `cp ${composePath} ${composePath}.bak.$(date +%s) 2>&1 || true`);
 
   // Assurer la présence de PyYAML (silencieux)
@@ -520,16 +520,22 @@ for name, svc in list(services.items()):
     if not isinstance(svc, dict):
         continue
     dep = svc.get("depends_on")
-    if isinstance(dep, dict) and "analytics" in dep:
-        dep.pop("analytics", None)
-        changed += 1
+    blocking = ("analytics", "vector", "studio")
+    if isinstance(dep, dict):
+        for b in blocking:
+            if b in dep:
+                dep.pop(b, None)
+                changed += 1
         if not dep:
             svc.pop("depends_on", None)
-    elif isinstance(dep, list) and "analytics" in dep:
-        svc["depends_on"] = [d for d in dep if d != "analytics"]
-        changed += 1
-        if not svc["depends_on"]:
-            svc.pop("depends_on", None)
+    elif isinstance(dep, list):
+        kept = [d for d in dep if d not in blocking]
+        if len(kept) != len(dep):
+            changed += len(dep) - len(kept)
+            if kept:
+                svc["depends_on"] = kept
+            else:
+                svc.pop("depends_on", None)
 out = "${sentinel}\\n" + yaml.safe_dump(data, sort_keys=False, default_flow_style=False, width=4096)
 p.write_text(out)
 print("OK changed=%d" % changed)

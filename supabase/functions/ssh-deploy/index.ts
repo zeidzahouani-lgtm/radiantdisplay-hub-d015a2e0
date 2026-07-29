@@ -706,9 +706,13 @@ FOR ALL TO anon, authenticated
 USING (true)
 WITH CHECK (true);
 
-INSERT INTO storage.buckets (id, name, public)
-VALUES ('media', 'media', true)
-ON CONFLICT (id) DO UPDATE SET public = true;
+INSERT INTO storage.buckets (id, name, public, file_size_limit)
+VALUES ('media', 'media', true, 1073741824)
+ON CONFLICT (id) DO UPDATE SET public = true, file_size_limit = 1073741824;
+
+INSERT INTO storage.buckets (id, name, public, file_size_limit)
+VALUES ('uploads', 'uploads', true, 1073741824)
+ON CONFLICT (id) DO UPDATE SET public = true, file_size_limit = 1073741824;
 
 DROP POLICY IF EXISTS "Local dashboard can manage screens" ON public.screens;
 CREATE POLICY "Local dashboard can manage screens" ON public.screens

@@ -763,44 +763,44 @@ WITH CHECK (public.has_role(auth.uid(), 'admin'::public.app_role));
 DROP POLICY IF EXISTS "Local dashboard can read media files" ON storage.objects;
 CREATE POLICY "Local dashboard can read media files" ON storage.objects
 FOR SELECT TO anon, authenticated
-USING (bucket_id = 'media');
+USING (bucket_id IN ('media','uploads'));
 
 DROP POLICY IF EXISTS "Local dashboard can upload media files" ON storage.objects;
 CREATE POLICY "Local dashboard can upload media files" ON storage.objects
 FOR INSERT TO anon, authenticated
-WITH CHECK (bucket_id = 'media');
+WITH CHECK (bucket_id IN ('media','uploads'));
 
 DROP POLICY IF EXISTS "Local dashboard can update media files" ON storage.objects;
 CREATE POLICY "Local dashboard can update media files" ON storage.objects
 FOR UPDATE TO anon, authenticated
-USING (bucket_id = 'media')
-WITH CHECK (bucket_id = 'media');
+USING (bucket_id IN ('media','uploads'))
+WITH CHECK (bucket_id IN ('media','uploads'));
 
 DROP POLICY IF EXISTS "Local dashboard can delete media files" ON storage.objects;
 CREATE POLICY "Local dashboard can delete media files" ON storage.objects
 FOR DELETE TO anon, authenticated
-USING (bucket_id = 'media');
+USING (bucket_id IN ('media','uploads'));
 
 DROP POLICY IF EXISTS "Authenticated users can upload media files" ON storage.objects;
 CREATE POLICY "Authenticated users can upload media files" ON storage.objects
 FOR INSERT TO authenticated
-WITH CHECK (bucket_id = 'media');
+WITH CHECK (bucket_id IN ('media','uploads'));
 
 DROP POLICY IF EXISTS "Authenticated users can update media files" ON storage.objects;
 CREATE POLICY "Authenticated users can update media files" ON storage.objects
 FOR UPDATE TO authenticated
-USING (bucket_id = 'media')
-WITH CHECK (bucket_id = 'media');
+USING (bucket_id IN ('media','uploads'))
+WITH CHECK (bucket_id IN ('media','uploads'));
 
 DROP POLICY IF EXISTS "Authenticated users can delete media files" ON storage.objects;
 CREATE POLICY "Authenticated users can delete media files" ON storage.objects
 FOR DELETE TO authenticated
-USING (bucket_id = 'media');
+USING (bucket_id IN ('media','uploads'));
 
 DROP POLICY IF EXISTS "Public can read media files" ON storage.objects;
 CREATE POLICY "Public can read media files" ON storage.objects
 FOR SELECT TO anon, authenticated
-USING (bucket_id = 'media');
+USING (bucket_id IN ('media','uploads'));
 `;
   const result = await exec(conn, dockerPsql(supaDir, btoa(sql), false));
   const output = `${result.stdout}${result.stderr}`;

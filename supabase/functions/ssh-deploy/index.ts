@@ -669,7 +669,7 @@ async function ensureLocalApiServices(conn: Client, supaDir: string, kongPort: s
   }
 
   await log("⚠ REST/Storage répondent mal (souvent HTTP 503). Redémarrage ciblé rapide des services locaux…");
-  const restart = await exec(conn, `cd ${supaDir} && docker compose up -d db rest storage realtime auth kong 2>&1 && docker compose restart rest storage realtime kong 2>&1 || true`);
+  const restart = await exec(conn, `cd ${supaDir} && docker compose up -d --no-deps db kong 2>&1; docker compose up -d --no-deps --force-recreate rest storage realtime auth 2>&1 || true`);
   await log((`${restart.stdout}${restart.stderr}`).slice(-1600));
   probe = await exec(conn, probeCmd);
   output = `${probe.stdout}${probe.stderr}`;

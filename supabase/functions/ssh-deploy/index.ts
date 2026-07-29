@@ -1466,7 +1466,47 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
         await log(`✓ Supabase local déjà installé dans ${remoteDir}/supabase — réutilisation de la configuration existante`);
       }
 
+      // ===== Clone/maj du dépôt applicatif AVANT la stack Supabase =====
+      // Le build de l'app est l'étape critique : si la stack locale consomme tout le budget,
+      // le dépôt doit déjà être présent pour que le build détaché puisse démarrer.
+      log(`→ Preparing remote directory ${remoteDir}…`);
+      await exec(conn, `${sudoPrefix}mkdir -p ${remoteDir} && ${sudoPrefix}chown ${body.username}:${body.username} ${remoteDir} && if [ -d ${remoteDir}/repo ]; then ${sudoPrefix}chown -R ${body.username}:${body.username} ${remoteDir}/repo; fi`);
+      log("✓ Remote directory ready");
+
+      if (isExistingInstall) {
+        await log(`→ Mise à jour du repo existant (git fetch + reset --hard origin/${branch})…`);
+        const pull = await exec(
+          conn,
+          `cd ${remoteDir}/repo && ` +
+          `git remote set-url origin '${gitUrl}' 2>&1 && ` +
+          `git fetch --depth 1 origin ${branch} 2>&1 && ` +
+          `git reset --hard origin/${branch} 2>&1 && ` +
+          `git clean -fd 2>&1`,
+        );
+        log(pull.stdout.slice(-1500));
+        if (pull.code !== 0) {
+          await log("⚠ git pull a échoué, fallback sur clone complet…");
+          await exec(conn, `rm -rf ${remoteDir}/repo`);
+          const clone = await exec(conn, `git clone --depth 1 --branch ${branch} '${gitUrl}' ${remoteDir}/repo 2>&1`);
+          log(clone.stdout.slice(-1500));
+          if (clone.code !== 0) {
+            throw new Error(`Échec du clone Git de secours. ${clone.stderr.slice(-300)}`);
+          }
+        }
+        await log("✓ Repo mis à jour vers la dernière version");
+      } else {
+        log(`→ Cloning ${body.git_url} (branch: ${branch})…`);
+        await exec(conn, `rm -rf ${remoteDir}/repo`);
+        const clone = await exec(conn, `git clone --depth 1 --branch ${branch} '${gitUrl}' ${remoteDir}/repo 2>&1`);
+        log(clone.stdout.slice(-1500));
+        if (clone.code !== 0) {
+          throw new Error(`Échec du clone Git. Vérifiez l'URL/branche/token. ${clone.stderr.slice(-300)}`);
+        }
+        log("✓ Repo cloned");
+      }
+
       await ensureDeploymentBudget("installation/contrôle Supabase local");
+
 
       // ===== Optional: install self-hosted Supabase on the same server =====
       if (installSupabase && !isExistingSupabase) {

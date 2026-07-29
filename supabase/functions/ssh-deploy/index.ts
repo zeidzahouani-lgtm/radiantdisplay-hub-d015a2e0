@@ -476,7 +476,7 @@ async function handleAnalyticsUnhealthy(conn: Client, supaDir: string, log: (m: 
  * et on commente le service analytics + vector. Idempotent (sentinelle).
  */
 async function patchComposeRemoveAnalytics(conn: Client, supaDir: string, log: (m: string) => Promise<void> | void) {
-  const sentinel = "# LOVABLE_NO_ANALYTICS_PATCH_V2";
+  const sentinel = "# LOVABLE_NO_ANALYTICS_PATCH_V3";
   const composePath = `${supaDir}/docker-compose.yml`;
 
   // 0) Si un patch précédent (V1 regex) a corrompu le fichier, restaurer le backup le plus ancien
@@ -499,11 +499,11 @@ async function patchComposeRemoveAnalytics(conn: Client, supaDir: string, log: (
 
   const check = await exec(conn, `grep -q '${sentinel}' ${composePath} && echo PATCHED || echo TODO`);
   if (/PATCHED/.test(check.stdout)) {
-    await log("✓ docker-compose déjà patché (analytics désactivé).");
+    await log("✓ docker-compose déjà patché (dépendances analytics/vector/studio neutralisées).");
     return;
   }
 
-  await log("→ Patch docker-compose.yml via PyYAML (suppression dépendance analytics)…");
+  await log("→ Patch docker-compose.yml via PyYAML (suppression dépendances bloquantes analytics/vector/studio)…");
   await exec(conn, `cp ${composePath} ${composePath}.bak.$(date +%s) 2>&1 || true`);
 
   // Assurer la présence de PyYAML (silencieux)
@@ -520,16 +520,22 @@ for name, svc in list(services.items()):
     if not isinstance(svc, dict):
         continue
     dep = svc.get("depends_on")
-    if isinstance(dep, dict) and "analytics" in dep:
-        dep.pop("analytics", None)
-        changed += 1
+    blocking = ("analytics", "vector", "studio")
+    if isinstance(dep, dict):
+        for b in blocking:
+            if b in dep:
+                dep.pop(b, None)
+                changed += 1
         if not dep:
             svc.pop("depends_on", None)
-    elif isinstance(dep, list) and "analytics" in dep:
-        svc["depends_on"] = [d for d in dep if d != "analytics"]
-        changed += 1
-        if not svc["depends_on"]:
-            svc.pop("depends_on", None)
+    elif isinstance(dep, list):
+        kept = [d for d in dep if d not in blocking]
+        if len(kept) != len(dep):
+            changed += len(dep) - len(kept)
+            if kept:
+                svc["depends_on"] = kept
+            else:
+                svc.pop("depends_on", None)
 out = "${sentinel}\\n" + yaml.safe_dump(data, sort_keys=False, default_flow_style=False, width=4096)
 p.write_text(out)
 print("OK changed=%d" % changed)
@@ -663,7 +669,7 @@ async function ensureLocalApiServices(conn: Client, supaDir: string, kongPort: s
   }
 
   await log("⚠ REST/Storage répondent mal (souvent HTTP 503). Redémarrage ciblé rapide des services locaux…");
-  const restart = await exec(conn, `cd ${supaDir} && docker compose up -d db rest storage realtime auth kong 2>&1 && docker compose restart rest storage realtime kong 2>&1 || true`);
+  const restart = await exec(conn, `cd ${supaDir} && docker compose up -d --no-deps db kong 2>&1; docker compose up -d --no-deps --force-recreate rest storage realtime auth 2>&1 || true`);
   await log((`${restart.stdout}${restart.stderr}`).slice(-1600));
   probe = await exec(conn, probeCmd);
   output = `${probe.stdout}${probe.stderr}`;
@@ -1374,7 +1380,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
   let supabaseAnonOverride = "";
   let supabaseProjectIdOverride = "";
   // L'edge function est coupée par le runtime après ~400s : on sort proprement avant.
-  const deploymentDeadline = Date.now() + 5.5 * 60 * 1000;
+  const deploymentDeadline = Date.now() + 8 * 60 * 1000;
   const ensureDeploymentBudget = async (nextStep: string) => {
     if (Date.now() <= deploymentDeadline) return;
     await log(`⚠ Délai maximum atteint avant: ${nextStep}`);
@@ -1466,7 +1472,47 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
         await log(`✓ Supabase local déjà installé dans ${remoteDir}/supabase — réutilisation de la configuration existante`);
       }
 
+      // ===== Clone/maj du dépôt applicatif AVANT la stack Supabase =====
+      // Le build de l'app est l'étape critique : si la stack locale consomme tout le budget,
+      // le dépôt doit déjà être présent pour que le build détaché puisse démarrer.
+      log(`→ Preparing remote directory ${remoteDir}…`);
+      await exec(conn, `${sudoPrefix}mkdir -p ${remoteDir} && ${sudoPrefix}chown ${body.username}:${body.username} ${remoteDir} && if [ -d ${remoteDir}/repo ]; then ${sudoPrefix}chown -R ${body.username}:${body.username} ${remoteDir}/repo; fi`);
+      log("✓ Remote directory ready");
+
+      if (isExistingInstall) {
+        await log(`→ Mise à jour du repo existant (git fetch + reset --hard origin/${branch})…`);
+        const pull = await exec(
+          conn,
+          `cd ${remoteDir}/repo && ` +
+          `git remote set-url origin '${gitUrl}' 2>&1 && ` +
+          `git fetch --depth 1 origin ${branch} 2>&1 && ` +
+          `git reset --hard origin/${branch} 2>&1 && ` +
+          `git clean -fd 2>&1`,
+        );
+        log(pull.stdout.slice(-1500));
+        if (pull.code !== 0) {
+          await log("⚠ git pull a échoué, fallback sur clone complet…");
+          await exec(conn, `rm -rf ${remoteDir}/repo`);
+          const clone = await exec(conn, `git clone --depth 1 --branch ${branch} '${gitUrl}' ${remoteDir}/repo 2>&1`);
+          log(clone.stdout.slice(-1500));
+          if (clone.code !== 0) {
+            throw new Error(`Échec du clone Git de secours. ${clone.stderr.slice(-300)}`);
+          }
+        }
+        await log("✓ Repo mis à jour vers la dernière version");
+      } else {
+        log(`→ Cloning ${body.git_url} (branch: ${branch})…`);
+        await exec(conn, `rm -rf ${remoteDir}/repo`);
+        const clone = await exec(conn, `git clone --depth 1 --branch ${branch} '${gitUrl}' ${remoteDir}/repo 2>&1`);
+        log(clone.stdout.slice(-1500));
+        if (clone.code !== 0) {
+          throw new Error(`Échec du clone Git. Vérifiez l'URL/branche/token. ${clone.stderr.slice(-300)}`);
+        }
+        log("✓ Repo cloned");
+      }
+
       await ensureDeploymentBudget("installation/contrôle Supabase local");
+
 
       // ===== Optional: install self-hosted Supabase on the same server =====
       if (installSupabase && !isExistingSupabase) {
@@ -1637,44 +1683,9 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
         (globalThis as any).__pendingLocalMigrations = { supaDir, postgresPw };
       }
 
-      await ensureDeploymentBudget("clone ou mise à jour du dépôt Git");
-      log(`→ Preparing remote directory ${remoteDir}…`);
-      // Ne jamais chown -R tout remoteDir ici : il contient aussi le volume Postgres local,
-      // et un chown récursif casse global/pg_filenode.map. On ne touche qu'au dossier repo.
-      await exec(conn, `${sudoPrefix}mkdir -p ${remoteDir} && ${sudoPrefix}chown ${body.username}:${body.username} ${remoteDir} && if [ -d ${remoteDir}/repo ]; then ${sudoPrefix}chown -R ${body.username}:${body.username} ${remoteDir}/repo; fi`);
-      log("✓ Remote directory ready");
+      // (Le dépôt applicatif a déjà été cloné/mis à jour plus haut, avant l'installation Supabase,
+      //  pour garantir que le build de l'application ait toujours lieu même si la stack locale est lente.)
 
-      if (isExistingInstall) {
-        await log(`→ Mise à jour du repo existant (git fetch + reset --hard origin/${branch})…`);
-        const pull = await exec(
-          conn,
-          `cd ${remoteDir}/repo && ` +
-          `git remote set-url origin '${gitUrl}' 2>&1 && ` +
-          `git fetch --depth 1 origin ${branch} 2>&1 && ` +
-          `git reset --hard origin/${branch} 2>&1 && ` +
-          `git clean -fd 2>&1`,
-        );
-        log(pull.stdout.slice(-1500));
-        if (pull.code !== 0) {
-          await log("⚠ git pull a échoué, fallback sur clone complet…");
-          await exec(conn, `rm -rf ${remoteDir}/repo`);
-          const clone = await exec(conn, `git clone --depth 1 --branch ${branch} '${gitUrl}' ${remoteDir}/repo 2>&1`);
-          log(clone.stdout.slice(-1500));
-          if (clone.code !== 0) {
-            throw new Error(`Échec du clone Git de secours. ${clone.stderr.slice(-300)}`);
-          }
-        }
-        await log("✓ Repo mis à jour vers la dernière version");
-      } else {
-        log(`→ Cloning ${body.git_url} (branch: ${branch})…`);
-        await exec(conn, `rm -rf ${remoteDir}/repo`);
-        const clone = await exec(conn, `git clone --depth 1 --branch ${branch} '${gitUrl}' ${remoteDir}/repo 2>&1`);
-        log(clone.stdout.slice(-1500));
-        if (clone.code !== 0) {
-          throw new Error(`Échec du clone Git. Vérifiez l'URL/branche/token. ${clone.stderr.slice(-300)}`);
-        }
-        log("✓ Repo cloned");
-      }
 
       await ensureDeploymentBudget("migrations locales");
       // ===== Apply app migrations to local Supabase =====

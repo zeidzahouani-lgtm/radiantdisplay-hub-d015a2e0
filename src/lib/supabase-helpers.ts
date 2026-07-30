@@ -38,7 +38,7 @@ function parseStorageError(responseText: string): { message: string; code: strin
   }
 }
 
-type UploadResult = { ok: true } | { ok: false; status: number; message: string; code: string; raw: string };
+type UploadResult = { ok: boolean; status: number; message: string; code: string; raw: string };
 
 async function putObject(
   bucket: string,
@@ -67,7 +67,7 @@ async function putObject(
 
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
-        resolve({ ok: true });
+        resolve({ ok: true, status: xhr.status, message: "", code: "", raw: "" });
         return;
       }
       const parsed = parseStorageError(xhr.responseText);

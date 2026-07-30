@@ -2004,6 +2004,7 @@ ${portsBlock}
       await uploadFile(conn, `${remoteDir}/repo/Dockerfile`, Buffer.from(dockerfile));
       await uploadFile(conn, `${remoteDir}/repo/nginx.conf`, Buffer.from(nginxConf));
       await uploadFile(conn, `${remoteDir}/repo/docker-compose.yml`, Buffer.from(compose));
+      await patchRemoteRuntimeSupabaseClient(conn, `${remoteDir}/repo`, log);
       log("✓ Build files ready");
 
       if (enableHttps) {
@@ -2196,6 +2197,7 @@ server {
 `;
 
   await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(nginxConf));
+  await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
   const patchCompose = `python3 - <<'PY'
 import base64, pathlib, re
 p = pathlib.Path(${JSON.stringify(`${repoDir}/docker-compose.yml`)})

@@ -116,17 +116,35 @@ function ssh(opts: { host: string; port: number; username: string; password: str
 
 function exec(conn: Client, cmd: string): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    conn.exec(cmd, (err: any, stream: any) => {
-      if (err) return reject(err);
-      let stdout = "";
-      let stderr = "";
-      stream
-        .on("close", (code: number) => resolve({ code: code ?? 0, stdout, stderr }))
-        .on("data", (d: Buffer) => (stdout += d.toString()))
-        .stderr.on("data", (d: Buffer) => (stderr += d.toString()));
-    });
+    try {
+      conn.exec(cmd, (err: any, stream: any) => {
+        if (err) return reject(err);
+        if (!stream) return resolve({ code: 1, stdout: "", stderr: "no stream" });
+        let stdout = "";
+        let stderr = "";
+        let settled = false;
+        const done = (code: number) => {
+          if (settled) return;
+          settled = true;
+          resolve({ code: typeof code === "number" ? code : 0, stdout: stdout ?? "", stderr: stderr ?? "" });
+        };
+        stream.on("close", (code: number) => done(code));
+        stream.on("data", (d: any) => (stdout += String(d)));
+        if (stream.stderr && typeof stream.stderr.on === "function") {
+          stream.stderr.on("data", (d: any) => (stderr += String(d)));
+        }
+        stream.on("error", (e: any) => {
+          if (settled) return;
+          settled = true;
+          resolve({ code: 1, stdout: stdout ?? "", stderr: `${stderr ?? ""}${e?.message || String(e)}` });
+        });
+      });
+    } catch (e) {
+      reject(e);
+    }
   });
 }
+
 
 /**
  * Lance `docker compose up -d --build` en arrière-plan sur le serveur (nohup),
@@ -143,7 +161,7 @@ async function startDetachedCompose(conn: Client, repoDir: string, stateDir: str
     `chmod +x ${script} && rm -f ${stateDir}/build.code && : > ${stateDir}/build.log && ` +
     `(setsid nohup ${script} >/dev/null 2>&1 & ) && echo STARTED`;
   const res = await exec(conn, cmd);
-  if (!res.stdout.includes("STARTED")) {
+  if (!(res.stdout || "").includes("STARTED")) {
     throw new Error("Impossible de lancer le build en arrière-plan: " + (res.stderr || res.stdout).slice(-300));
   }
 }
@@ -985,7 +1003,7 @@ async function syncLocalAuthSafeEnv(conn: Client, supaDir: string, log: (m: stri
 async function syncLocalEdgeFunctions(conn: Client, remoteDir: string, supaDir: string, log: (m: string) => Promise<void> | void) {
   const fnDir = `${remoteDir}/repo/supabase/functions`;
   const probe = await exec(conn, `[ -d ${fnDir} ] && echo OK || echo MISSING`);
-  if (!probe.stdout.includes("OK")) {
+  if (!(probe.stdout || "").includes("OK")) {
     await log("⚠ Aucun dossier de fonctions backend trouvé dans le repo cloné.");
     return;
   }
@@ -1257,9 +1275,11 @@ async function runDeploymentJob(
     const result = directResult ?? (globalThis as any).__lastDeployResult ?? null;
     await persist({ status: "success", logs, result });
   } catch (e: any) {
-    logs.push("✗ ERROR: " + (e?.message || String(e)));
-    await persist({ status: "error", logs, error: e?.message || String(e) });
+    const detail = `${e?.message || String(e)}${e?.stack ? ` | ${String(e.stack).split("\n").slice(0, 4).join(" ⏎ ")}` : ""}`;
+    logs.push("✗ ERROR: " + detail);
+    await persist({ status: "error", logs, error: detail });
   }
+
 }
 
 Deno.serve(async (req) => {
@@ -1458,7 +1478,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
 
       // Ensure git
       const gitCheck = await exec(conn, "command -v git || echo MISSING");
-      if (gitCheck.stdout.includes("MISSING")) {
+      if ((gitCheck.stdout || "").includes("MISSING")) {
         log("→ Installing git…");
         await exec(conn, `${sudoPrefix}sh -c "(apt-get update -y && apt-get install -y git) || (dnf install -y git) || (yum install -y git)"`);
       }
@@ -1468,12 +1488,12 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
         conn,
         `test -d ${remoteDir}/repo/.git && test -f ${remoteDir}/repo/docker-compose.yml && echo EXISTS || echo NEW`,
       );
-      let isExistingInstall = existingCheck.stdout.includes("EXISTS");
+      let isExistingInstall = (existingCheck.stdout || "").includes("EXISTS");
       const supaDirCheck = await exec(
         conn,
         `test -f ${remoteDir}/supabase/docker-compose.yml && test -f ${remoteDir}/supabase/.env && echo EXISTS || echo NEW`,
       );
-      let isExistingSupabase = supaDirCheck.stdout.includes("EXISTS");
+      let isExistingSupabase = (supaDirCheck.stdout || "").includes("EXISTS");
 
       if (forceFreshInstall && (isExistingInstall || isExistingSupabase)) {
         await log(`⚠ Réinstallation complète demandée — arrêt et suppression de l'installation existante dans ${remoteDir}…`);
@@ -1560,7 +1580,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
         const dashboardPw = randHex(16);
 
         const jwtGen = await exec(conn, `docker run --rm -e S='${jwtSecret}' node:20-alpine node -e "const c=require('crypto');const s=process.env.S;function b64(o){return Buffer.from(JSON.stringify(o)).toString('base64url')}function sign(p){const h=b64({alg:'HS256',typ:'JWT'});const b=b64(p);const sig=c.createHmac('sha256',s).update(h+'.'+b).digest('base64url');return h+'.'+b+'.'+sig}const iat=Math.floor(Date.now()/1000),exp=iat+315360000;console.log(sign({role:'anon',iss:'supabase',iat,exp}));console.log(sign({role:'service_role',iss:'supabase',iat,exp}));"`);
-        const jwtLines = jwtGen.stdout.trim().split("\n").filter((l: string) => l.startsWith("ey"));
+        const jwtLines = (jwtGen.stdout || "").trim().split("\n").filter((l: string) => l.startsWith("ey"));
         if (jwtLines.length < 2) {
           log("⚠ JWT gen output: " + jwtGen.stdout.slice(-400) + " | err: " + jwtGen.stderr.slice(-400));
           throw new Error("Échec génération des clés JWT Supabase");
@@ -1942,21 +1962,21 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
     const appUrl = resolveBrowserAppBase(body, appPort, enableHttps, httpsDomain, httpsPort);
     const localAppUrl = enableHttps ? `https://${localIp}:${httpsPort}` : `http://${localIp}:${appPort}`;
     const appCheck = await exec(conn, `curl -k -s -o /dev/null -w "%{http_code}" --max-time 10 ${localAppUrl} || echo FAIL`);
-    const appCode = appCheck.stdout.trim();
+    const appCode = (appCheck.stdout || "").trim();
     connectivity.app = { ok: /^(200|301|302|304)$/.test(appCode), detail: `HTTP ${appCode} sur ${localAppUrl} (vérification 127.0.0.1)` };
     await log(`  • App         : ${connectivity.app.ok ? "✓" : "✗"} ${connectivity.app.detail}`);
 
     if (installSupabase) {
       // REST
       const restCheck = await exec(conn, `curl -k -s -o /dev/null -w "%{http_code}" --max-time 10 -H "apikey: ${supabaseAnonOverride}" "http://127.0.0.1:${supaKongPort}/rest/v1/" || echo FAIL`);
-      connectivity.rest = { ok: /^(200|401|404)$/.test(restCheck.stdout.trim()), detail: `HTTP ${restCheck.stdout.trim()} sur Kong /rest/v1/` };
+      connectivity.rest = { ok: /^(200|401|404)$/.test((restCheck.stdout || "").trim()), detail: `HTTP ${(restCheck.stdout || "").trim()} sur Kong /rest/v1/` };
       const authCheck = await exec(conn, `curl -k -s -o /dev/null -w "%{http_code}" --max-time 10 "http://127.0.0.1:${supaKongPort}/auth/v1/health" || echo FAIL`);
-      connectivity.auth = { ok: /^(200|404)$/.test(authCheck.stdout.trim()), detail: `HTTP ${authCheck.stdout.trim()} sur /auth/v1/health` };
+      connectivity.auth = { ok: /^(200|404)$/.test((authCheck.stdout || "").trim()), detail: `HTTP ${(authCheck.stdout || "").trim()} sur /auth/v1/health` };
       const storageCheck = await exec(conn, `curl -k -s -o /dev/null -w "%{http_code}" --max-time 10 -H "apikey: ${supabaseAnonOverride}" "http://127.0.0.1:${supaKongPort}/storage/v1/bucket" || echo FAIL`);
-      connectivity.storage = { ok: /^(200|401|403|404)$/.test(storageCheck.stdout.trim()), detail: `HTTP ${storageCheck.stdout.trim()} sur /storage/v1/bucket` };
+      connectivity.storage = { ok: /^(200|401|403|404)$/.test((storageCheck.stdout || "").trim()), detail: `HTTP ${(storageCheck.stdout || "").trim()} sur /storage/v1/bucket` };
       // Postgres direct
       const pgCheck = await exec(conn, `(cd ${remoteDir}/supabase && docker compose exec -T --user postgres db pg_isready -h 127.0.0.1 -U postgres 2>&1) || echo FAIL`);
-      connectivity.postgres = { ok: /accepting connections/i.test(pgCheck.stdout), detail: pgCheck.stdout.trim().slice(-120) };
+      connectivity.postgres = { ok: /accepting connections/i.test(pgCheck.stdout), detail: (pgCheck.stdout || "").trim().slice(-120) };
       await log(`  • Supabase REST    : ${connectivity.rest.ok ? "✓" : "✗"} ${connectivity.rest.detail}`);
       await log(`  • Supabase Auth    : ${connectivity.auth.ok ? "✓" : "✗"} ${connectivity.auth.detail}`);
       await log(`  • Supabase Storage : ${connectivity.storage.ok ? "✓" : "✗"} ${connectivity.storage.detail}`);
@@ -1965,7 +1985,7 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
 
     if (installPostgresOnly) {
       const pgCheck = await exec(conn, `docker exec screenflow_postgres pg_isready -U postgres 2>&1 || echo FAIL`);
-      connectivity.postgres = { ok: /accepting connections/i.test(pgCheck.stdout), detail: pgCheck.stdout.trim().slice(-120) };
+      connectivity.postgres = { ok: /accepting connections/i.test(pgCheck.stdout), detail: (pgCheck.stdout || "").trim().slice(-120) };
       await log(`  • Postgres standalone : ${connectivity.postgres.ok ? "✓" : "✗"} ${connectivity.postgres.detail}`);
     }
 
@@ -2003,7 +2023,7 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
             await log("⚠ Confirmation Auth échouée : " + connectivity.auth_login.detail);
           }
           const storageConfirm = await exec(conn, `curl -k -s -o /dev/null -w "%{http_code}" --max-time 10 -H "apikey: ${supabaseAnonOverride}" -H "Authorization: Bearer ${supabaseAnonOverride}" "http://127.0.0.1:${supaKongPort}/storage/v1/bucket" || echo FAIL`);
-          const storageCode = storageConfirm.stdout.trim();
+          const storageCode = (storageConfirm.stdout || "").trim();
           connectivity.storage_confirm = { ok: /^(200|401|403)$/.test(storageCode), detail: `HTTP ${storageCode} sur /storage/v1/bucket` };
           await log(`  • Storage confirmation : ${connectivity.storage_confirm.ok ? "✓" : "✗"} ${connectivity.storage_confirm.detail}`);
         }
@@ -2105,7 +2125,7 @@ PY`;
   const probeRest = await exec(conn, `curl -sS -m 10 -o /dev/null -w "%{http_code}" ${shQuote(`http://127.0.0.1:${kongPort}/rest/v1/`)} -H ${shQuote(`apikey: ${anonKey}`)} -H ${shQuote(`Authorization: Bearer ${anonKey}`)} 2>/dev/null || true`);
   const probeAuth = await exec(conn, `curl -sS -m 10 -o /dev/null -w "%{http_code}" ${shQuote(`http://127.0.0.1:${kongPort}/auth/v1/health`)} 2>/dev/null || true`);
   await log(`✓ URL API corrigée. Ouvrez l'application en HTTP : ${publicBase}`);
-  await log(`  • Vérif locale 127.0.0.1:${kongPort} → Storage HTTP ${probe.stdout.trim() || "n/a"}, REST HTTP ${probeRest.stdout.trim() || "n/a"}, Auth HTTP ${probeAuth.stdout.trim() || "n/a"}`);
+  await log(`  • Vérif locale 127.0.0.1:${kongPort} → Storage HTTP ${(probe.stdout || "").trim() || "n/a"}, REST HTTP ${(probeRest.stdout || "").trim() || "n/a"}, Auth HTTP ${(probeAuth.stdout || "").trim() || "n/a"}`);
   (globalThis as any).__lastDeployResult = { action: "repair_local_api_url", ok: true, url: publicBase, supabase_local: { url: publicBase, anon_key: anonKey } };
 }
 
@@ -2171,7 +2191,7 @@ async function patchRunningWebProxyForUploads(conn: Client, body: DeployBody, ko
   await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(nginxConf)).catch(() => undefined);
 
   const cidOut = await exec(conn, `CID=""; if [ -f ${repoDir}/docker-compose.yml ]; then CID=$(cd ${repoDir} && (docker compose ps -q web || docker-compose ps -q web) 2>/dev/null | head -1); fi; if [ -z "$CID" ]; then CID=$(docker ps --format '{{.ID}} {{.Names}}' | awk 'tolower($0) ~ /screenflow/ && tolower($0) ~ /web/ {print $1; exit}'); fi; echo "$CID"`);
-  const cid = cidOut.stdout.trim().split(/\s+/)[0] || "";
+  const cid = (cidOut.stdout || "").trim().split(/\s+/)[0] || "";
   if (!cid) {
     result.skipped = true;
     result.detail = "Aucun conteneur web actif détecté";
@@ -2210,7 +2230,7 @@ async function repairUploadsNowCore(conn: Client, body: DeployBody, log: (m: str
 
   await log("→ Démarrage/vérification des services Storage, REST et gateway…");
   const up = await exec(conn, `cd ${supaDir} && (docker compose up -d db kong rest storage auth 2>&1 || docker-compose up -d db kong rest storage auth 2>&1 || true)`);
-  if (up.stdout.trim() || up.stderr.trim()) await log(`${up.stdout}${up.stderr}`.slice(-1000));
+  if ((up.stdout || "").trim() || (up.stderr || "").trim()) await log(`${up.stdout}${up.stderr}`.slice(-1000));
 
   await applyLocalDashboardWriteHotfix(conn, supaDir, log);
   await exec(conn, `cd ${supaDir} && (docker compose restart storage rest kong 2>&1 || docker-compose restart storage rest kong 2>&1 || true)`);
@@ -2277,7 +2297,7 @@ async function runRepairLocalWrites(body: DeployBody, log: (m: string) => Promis
 
   try {
     const check = await exec(conn, `[ -f ${supaDir}/docker-compose.yml ] && echo OK || echo MISSING`);
-    if (!check.stdout.includes("OK")) {
+    if (!(check.stdout || "").includes("OK")) {
       throw new Error(`Aucune stack backend locale trouvée dans ${supaDir}. Lancez d'abord un déploiement complet avec Supabase local.`);
     }
     await ensurePostgresSqlAccess(conn, supaDir, log);
@@ -2315,7 +2335,7 @@ async function runResetAdminPassword(body: DeployBody, log: (m: string) => Promi
   try {
     // Sanity check: the local Supabase stack must exist
     const check = await exec(conn, `[ -f ${supaDir}/docker-compose.yml ] && echo OK || echo MISSING`);
-    if (!check.stdout.includes("OK")) {
+    if (!(check.stdout || "").includes("OK")) {
       throw new Error(
         `Aucune installation Supabase locale trouvée dans ${supaDir}. ` +
         `Lancez d'abord un déploiement complet, ou ajustez 'remote_dir'.`
@@ -2412,7 +2432,7 @@ async function runCheckAdminStatus(
 
   try {
     const check = await exec(conn, `[ -f ${supaDir}/docker-compose.yml ] && echo OK || echo MISSING`);
-    if (!check.stdout.includes("OK")) {
+    if (!(check.stdout || "").includes("OK")) {
       throw new Error(
         `Aucune installation Supabase locale trouvée dans ${supaDir}. ` +
         `Lancez d'abord un déploiement complet.`
@@ -2530,18 +2550,18 @@ async function runDiagnoseServer(
   try {
     // Docker
     const dockerVer = await exec(conn, `docker --version 2>&1 || echo MISSING`);
-    add({ key: "docker", label: "Docker installé", ok: !dockerVer.stdout.includes("MISSING"), detail: dockerVer.stdout.trim() });
+    add({ key: "docker", label: "Docker installé", ok: !(dockerVer.stdout || "").includes("MISSING"), detail: (dockerVer.stdout || "").trim() });
 
     // Project dirs
     const repoCheck = await exec(conn, `[ -d ${remoteDir} ] && echo OK || echo MISSING`);
-    add({ key: "repo_dir", label: `Dossier app ${remoteDir}`, ok: repoCheck.stdout.includes("OK") });
+    add({ key: "repo_dir", label: `Dossier app ${remoteDir}`, ok: (repoCheck.stdout || "").includes("OK") });
     const supaCheck = await exec(conn, `[ -f ${supaDir}/docker-compose.yml ] && echo OK || echo MISSING`);
-    const supaPresent = supaCheck.stdout.includes("OK");
+    const supaPresent = (supaCheck.stdout || "").includes("OK");
     add({ key: "supabase_stack", label: "Stack Supabase locale", ok: supaPresent, suggested_action: supaPresent ? undefined : "redeploy" });
 
     // Containers running
     const ps = await exec(conn, `docker ps --format '{{.Names}}|{{.Status}}' 2>&1 || true`);
-    const psLines = ps.stdout.split("\n").filter(Boolean);
+    const psLines = (ps.stdout || "").split("\n").filter(Boolean);
     const has = (re: RegExp) => psLines.some((l) => re.test(l));
     const webOk = has(/screenflow.*web|screenflow-web|^web\|/i) || has(/nginx/i);
     add({ key: "container_web", label: "Conteneur web (frontend)", ok: webOk, suggested_action: webOk ? undefined : "repair_web_container" });
@@ -2576,10 +2596,10 @@ async function runDiagnoseServer(
         const stor = await exec(conn, `curl -sS -m 8 -o /dev/null -w "%{http_code}" http://127.0.0.1:${kongPort}/storage/v1/bucket -H ${shQuote(`apikey: ${anonKey}`)} -H ${shQuote(`Authorization: Bearer ${anonKey}`)} 2>/dev/null || echo 000`);
         const rt = await exec(conn, `curl -sS -m 8 -o /dev/null -w "%{http_code}" http://127.0.0.1:${kongPort}/realtime/v1/ 2>/dev/null || echo 000`);
         const okHttp = (s: string) => /^(2|3|401|403|404|426)/.test(s.trim());
-        add({ key: "http_auth", label: "Auth HTTP", ok: okHttp(auth.stdout), detail: auth.stdout.trim(), suggested_action: okHttp(auth.stdout) ? undefined : "restart_stack" });
-        add({ key: "http_rest", label: "REST HTTP", ok: okHttp(rest.stdout), detail: rest.stdout.trim(), suggested_action: okHttp(rest.stdout) ? undefined : "repair_local_writes" });
-        add({ key: "http_storage", label: "Storage HTTP", ok: okHttp(stor.stdout), detail: stor.stdout.trim(), suggested_action: okHttp(stor.stdout) ? undefined : "repair_local_writes" });
-        add({ key: "http_realtime", label: "Realtime HTTP", ok: okHttp(rt.stdout), detail: rt.stdout.trim(), suggested_action: okHttp(rt.stdout) ? undefined : "repair_realtime" });
+        add({ key: "http_auth", label: "Auth HTTP", ok: okHttp(auth.stdout), detail: (auth.stdout || "").trim(), suggested_action: okHttp(auth.stdout) ? undefined : "restart_stack" });
+        add({ key: "http_rest", label: "REST HTTP", ok: okHttp(rest.stdout), detail: (rest.stdout || "").trim(), suggested_action: okHttp(rest.stdout) ? undefined : "repair_local_writes" });
+        add({ key: "http_storage", label: "Storage HTTP", ok: okHttp(stor.stdout), detail: (stor.stdout || "").trim(), suggested_action: okHttp(stor.stdout) ? undefined : "repair_local_writes" });
+        add({ key: "http_realtime", label: "Realtime HTTP", ok: okHttp(rt.stdout), detail: (rt.stdout || "").trim(), suggested_action: okHttp(rt.stdout) ? undefined : "repair_realtime" });
       }
 
       // Ensure psql works to inspect data
@@ -2607,7 +2627,7 @@ async function runDiagnoseServer(
     // Disk space
     const df = await exec(conn, `df -h / | tail -1 | awk '{print $5" used on "$6}'`);
     const used = parseInt((df.stdout || "0").trim().split("%")[0] || "0");
-    add({ key: "disk", label: "Espace disque /", ok: used < 90, detail: df.stdout.trim() });
+    add({ key: "disk", label: "Espace disque /", ok: used < 90, detail: (df.stdout || "").trim() });
 
     await log("");
     await log("════════════════════════════════════════════════════════════");
@@ -2644,7 +2664,7 @@ async function runBuildStatus(body: DeployBody, log: (m: string) => Promise<void
       await log("ℹ Aucun build détaché trouvé — lancez d'abord un déploiement ou une mise à jour rapide.");
       const psNone = await exec(conn, `cd ${repoDir} && (docker compose ps || docker-compose ps) 2>&1 | tail -20`);
       await log(psNone.stdout);
-      const r0 = { action: "build_status", found: false, running: false, ok: false, ps: psNone.stdout.trim() };
+      const r0 = { action: "build_status", found: false, running: false, ok: false, ps: (psNone.stdout || "").trim() };
       (globalThis as any).__lastDeployResult = r0;
       return r0;
     }
@@ -2663,15 +2683,15 @@ async function runBuildStatus(body: DeployBody, log: (m: string) => Promise<void
     await log(ps.stdout);
     const appPort = body.app_port || "8080";
     const http = await exec(conn, `curl -s -o /dev/null -w "%{http_code}" --max-time 10 http://127.0.0.1:${appPort} || echo FAIL`);
-    await log(`  • App HTTP 127.0.0.1:${appPort} → ${http.stdout.trim()}`);
+    await log(`  • App HTTP 127.0.0.1:${appPort} → ${(http.stdout || "").trim()}`);
     const result = {
       action: "build_status",
       found: true,
       running: false,
       ok,
       code: res.code,
-      ps: ps.stdout.trim(),
-      app_http: http.stdout.trim(),
+      ps: (ps.stdout || "").trim(),
+      app_http: (http.stdout || "").trim(),
     };
     (globalThis as any).__lastDeployResult = result;
     return result;
@@ -2694,7 +2714,7 @@ async function runRestartStack(body: DeployBody, log: (m: string) => Promise<voi
     if (supaPresent) {
       await log("→ Redémarrage de la stack Supabase locale…");
       const r1 = await exec(conn, `cd ${supaDir} && (docker compose restart || docker-compose restart) 2>&1`);
-      await log(r1.stdout.split("\n").slice(-15).join("\n"));
+      await log((r1.stdout || "").split("\n").slice(-15).join("\n"));
     } else {
       await log("ℹ Aucune stack Supabase locale détectée — étape ignorée.");
     }
@@ -2704,7 +2724,7 @@ async function runRestartStack(body: DeployBody, log: (m: string) => Promise<voi
       await log("→ Redémarrage du conteneur web…");
       // `restart` ne relance pas un conteneur absent : on utilise up -d puis restart.
       const r2 = await exec(conn, `cd ${repoDir} && ((docker compose up -d web && docker compose restart web) || (docker-compose up -d web && docker-compose restart web)) 2>&1`);
-      await log(r2.stdout.split("\n").slice(-15).join("\n"));
+      await log((r2.stdout || "").split("\n").slice(-15).join("\n"));
     } else {
       await log(`ℹ Aucun docker-compose.yml applicatif dans ${repoDir} — conteneur web non redémarré.`);
     }
@@ -2735,14 +2755,14 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
     // 1. Why is it down?
     await log("→ Analyse de l'état du conteneur web…");
     const state = await exec(conn, `cd ${repoDir} && (docker compose ps -a || docker-compose ps -a) 2>&1`);
-    await log(state.stdout.split("\n").slice(-15).join("\n"));
+    await log((state.stdout || "").split("\n").slice(-15).join("\n"));
     const lastBuild = await exec(conn, `tail -n 25 ${remoteDir}/.build/build.log 2>/dev/null || true`);
-    if (lastBuild.stdout.trim()) {
+    if ((lastBuild.stdout || "").trim()) {
       await log("ℹ Dernières lignes du build précédent :\n" + lastBuild.stdout.slice(-1500));
       if (/error|ERR!|failed/i.test(lastBuild.stdout)) result.cause = "Build précédent en erreur";
     }
     const webLogs = await exec(conn, `cd ${repoDir} && (docker compose logs --tail=25 web || docker-compose logs --tail=25 web) 2>&1 || true`);
-    if (webLogs.stdout.trim()) await log("ℹ Logs conteneur web :\n" + webLogs.stdout.slice(-1200));
+    if ((webLogs.stdout || "").trim()) await log("ℹ Logs conteneur web :\n" + webLogs.stdout.slice(-1200));
     if (!result.cause && !/Up\s/i.test(state.stdout)) result.cause = "Conteneur web arrêté ou jamais construit";
 
     // 2. Rebuild (detached so the edge runtime timeout cannot kill it)
@@ -2765,7 +2785,7 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
     // 3. Verify container up + nginx proxy for uploads
     const ps2 = await exec(conn, `cd ${repoDir} && (docker compose ps || docker-compose ps) 2>&1`);
     result.running = /Up\s|running/i.test(ps2.stdout);
-    await log(ps2.stdout.split("\n").slice(-10).join("\n"));
+    await log((ps2.stdout || "").split("\n").slice(-10).join("\n"));
 
     const cid = (await exec(conn, `cd ${repoDir} && (docker compose ps -q web || docker-compose ps -q web) 2>/dev/null | head -1`)).stdout.trim();
     if (cid) {
@@ -2777,12 +2797,12 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
         ? `✓ Proxy upload présent dans nginx (/storage/v1/ ${hasBodySize ? "+ client_max_body_size" : "SANS client_max_body_size"})`
         : "✗ Le proxy /storage/v1/ est absent de la config nginx du conteneur — les uploads échoueront.");
       const gw = await exec(conn, `docker exec ${cid} sh -c 'getent hosts host.docker.internal || true' 2>&1`);
-      result.host_gateway_ok = !!gw.stdout.trim();
+      result.host_gateway_ok = !!(gw.stdout || "").trim();
       await log(result.host_gateway_ok
-        ? `✓ host.docker.internal résolu (${gw.stdout.trim().split(/\s+/)[0]})`
+        ? `✓ host.docker.internal résolu (${(gw.stdout || "").trim().split(/\s+/)[0]})`
         : "✗ host.docker.internal non résolu dans le conteneur web — le proxy vers Kong/Storage ne peut pas fonctionner.");
       const up = await exec(conn, `docker exec ${cid} sh -c 'wget -q -S -O /dev/null http://host.docker.internal:8000/storage/v1/bucket 2>&1 | head -3' || true`);
-      if (up.stdout.trim()) await log("ℹ Test Storage depuis le conteneur web : " + up.stdout.trim().replace(/\s+/g, " ").slice(0, 200));
+      if ((up.stdout || "").trim()) await log("ℹ Test Storage depuis le conteneur web : " + (up.stdout || "").trim().replace(/\s+/g, " ").slice(0, 200));
     }
 
     // 4. Make sure storage service + policies/buckets are healthy (uploads)
@@ -2854,7 +2874,7 @@ async function runRepairRealtime(body: DeployBody, log: (m: string) => Promise<v
       end $$;`).join("\n")}
     `;
     const out = await exec(conn, dockerPsqlExec(supaDir, sql));
-    await log(out.stdout.split("\n").slice(-20).join("\n"));
+    await log((out.stdout || "").split("\n").slice(-20).join("\n"));
     await exec(conn, `cd ${supaDir} && (docker compose restart realtime || docker-compose restart realtime) 2>&1`);
     await log("✓ Realtime réparé (publication + redémarrage)");
     (globalThis as any).__lastDeployResult = { action: "repair_realtime", ok: true };
@@ -2893,13 +2913,13 @@ async function runApplyLocalMigrations(body: DeployBody, log: (m: string) => Pro
 
     // List all migration files
     const lsOut = await exec(conn, `ls ${migDir}/*.sql 2>/dev/null | sort`);
-    const allFiles = lsOut.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+    const allFiles = (lsOut.stdout || "").split("\n").map((s) => s.trim()).filter(Boolean);
     await log(`→ ${allFiles.length} fichier(s) de migration détecté(s)`);
 
     // Already applied (success)
     const appliedOut = await exec(conn, dockerPsqlSelect(supaDir, "select name from _lovable.migrations where success = true", false));
     const appliedSet = new Set(
-      appliedOut.stdout.split("\n").map((s) => s.trim()).filter((s) => s && !/^\(\d+ rows?\)$/.test(s)),
+      (appliedOut.stdout || "").split("\n").map((s) => s.trim()).filter((s) => s && !/^\(\d+ rows?\)$/.test(s)),
     );
 
     const summary: Array<{ name: string; status: "applied" | "skipped" | "error"; error?: string }> = [];
@@ -2995,7 +3015,7 @@ async function runQuickUpdate(body: DeployBody, log: (m: string) => Promise<void
     }
     const afterSha = (await exec(conn, `cd ${repoDir} && git rev-parse HEAD`)).stdout.trim();
     const diff = await exec(conn, `cd ${repoDir} && git diff --name-only ${beforeSha} ${afterSha} 2>/dev/null | wc -l`);
-    const changedFiles = parseInt(diff.stdout.trim(), 10) || 0;
+    const changedFiles = parseInt((diff.stdout || "").trim(), 10) || 0;
     summary.git = {
       ok: true,
       commit: afterSha.slice(0, 8),
@@ -3017,10 +3037,10 @@ async function runQuickUpdate(body: DeployBody, log: (m: string) => Promise<void
         );
       `));
       const lsOut = await exec(conn, `ls ${migDir}/*.sql 2>/dev/null | sort`);
-      const allFiles = lsOut.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+      const allFiles = (lsOut.stdout || "").split("\n").map((s) => s.trim()).filter(Boolean);
       const appliedOut = await exec(conn, dockerPsqlSelect(supaDir, "select name from _lovable.migrations where success = true", false));
       const appliedSet = new Set(
-        appliedOut.stdout.split("\n").map((s) => s.trim()).filter((s) => s && !/^\(\d+ rows?\)$/.test(s)),
+        (appliedOut.stdout || "").split("\n").map((s) => s.trim()).filter((s) => s && !/^\(\d+ rows?\)$/.test(s)),
       );
       const pending = allFiles.filter((f) => !appliedSet.has(f.split("/").pop()!));
       await log(`→ ${allFiles.length} migration(s) au total, ${pending.length} à appliquer`);
@@ -3105,7 +3125,7 @@ async function runNetworkInspect(body: DeployBody, log: (m: string) => Promise<v
   try {
     await log("→ Liste des réseaux Docker…");
     const ls = await exec(conn, "docker network ls --format '{{.ID}}\t{{.Name}}\t{{.Driver}}\t{{.Scope}}' 2>&1");
-    const networks = ls.stdout.trim().split("\n").filter(Boolean).map((line) => {
+    const networks = (ls.stdout || "").trim().split("\n").filter(Boolean).map((line) => {
       const [id, name, driver, scope] = line.split("\t");
       return { id, name, driver, scope };
     });
@@ -3120,7 +3140,7 @@ async function runNetworkInspect(body: DeployBody, log: (m: string) => Promise<v
     for (const net of projectNetworks) {
       const insp = await exec(conn, `docker network inspect ${net.name} --format '{{json .}}' 2>&1`);
       try {
-        const parsed = JSON.parse(insp.stdout.trim());
+        const parsed = JSON.parse((insp.stdout || "").trim());
         const ipam = parsed.IPAM?.Config?.[0] || {};
         const containers = Object.entries(parsed.Containers || {}).map(([cid, c]: [string, any]) => ({
           id: cid,
@@ -3142,11 +3162,11 @@ async function runNetworkInspect(body: DeployBody, log: (m: string) => Promise<v
 
     await log("→ Interfaces réseau de l'hôte…");
     const hostIfaces = await exec(conn, "ip -o -4 addr show 2>&1 | awk '{print $2, $4}' || ifconfig -a 2>&1");
-    const interfaces = hostIfaces.stdout.trim().split("\n").filter(Boolean);
+    const interfaces = (hostIfaces.stdout || "").trim().split("\n").filter(Boolean);
 
     await log("→ Mappings de ports actifs…");
     const ports = await exec(conn, "docker ps --format '{{.Names}}\t{{.Ports}}' 2>&1");
-    const portMap = ports.stdout.trim().split("\n").filter(Boolean).map((line) => {
+    const portMap = (ports.stdout || "").trim().split("\n").filter(Boolean).map((line) => {
       const [name, p] = line.split("\t");
       return { container: name, ports: p };
     });
@@ -3156,9 +3176,9 @@ async function runNetworkInspect(body: DeployBody, log: (m: string) => Promise<v
     const tests: any[] = [];
     if (webName) {
       const t1 = await exec(conn, `docker exec ${webName} sh -lc 'wget -q -T 3 -O - http://kong:8000/ 2>&1 | head -c 80' 2>&1`);
-      tests.push({ from: "web", to: "kong:8000", ok: (t1.code === 0), output: t1.stdout.trim() || t1.stderr.trim() });
+      tests.push({ from: "web", to: "kong:8000", ok: (t1.code === 0), output: (t1.stdout || "").trim() || (t1.stderr || "").trim() });
       const t2 = await exec(conn, `docker exec ${webName} sh -lc 'getent hosts db || nslookup db' 2>&1`);
-      tests.push({ from: "web", to: "db (DNS)", ok: t2.code === 0, output: t2.stdout.trim().split("\n")[0] || "" });
+      tests.push({ from: "web", to: "db (DNS)", ok: t2.code === 0, output: (t2.stdout || "").trim().split("\n")[0] || "" });
     }
 
     await log("✓ Inspection terminée");
@@ -3191,12 +3211,12 @@ async function runNetworkRecreate(body: DeployBody, log: (m: string) => Promise<
     if (supaPresent) {
       await log("→ Redémarrage Supabase…");
       const r1 = await exec(conn, `cd ${supaDir} && (docker compose up -d || docker-compose up -d) 2>&1`);
-      await log(r1.stdout.split("\n").slice(-10).join("\n"));
+      await log((r1.stdout || "").split("\n").slice(-10).join("\n"));
     }
     if (repoPresent) {
       await log("→ Redémarrage web…");
       const r2 = await exec(conn, `cd ${remoteDir}/repo && (docker compose up -d || docker-compose up -d) 2>&1`);
-      await log(r2.stdout.split("\n").slice(-10).join("\n"));
+      await log((r2.stdout || "").split("\n").slice(-10).join("\n"));
     }
     await log("✓ Réseau Docker recréé");
     return { action: "network_recreate", ok: true };
@@ -3273,14 +3293,14 @@ async function runNetworkSetSubnet(body: DeployBody, log: (m: string) => Promise
     await exec(conn, `docker network rm ${netName} 2>/dev/null || true`);
     await log("→ Redémarrage avec la nouvelle configuration réseau…");
     const r = await exec(conn, `cd ${targetDir} && (docker compose -f docker-compose.yml -f docker-compose.network.yml up -d || docker-compose -f docker-compose.yml -f docker-compose.network.yml up -d) 2>&1`);
-    await log(r.stdout.split("\n").slice(-15).join("\n"));
+    await log((r.stdout || "").split("\n").slice(-15).join("\n"));
 
     const insp = await exec(conn, `docker network inspect ${netName} --format '{{(index .IPAM.Config 0).Subnet}} {{(index .IPAM.Config 0).Gateway}}' 2>&1`);
-    await log(`✓ Réseau '${netName}' actif → ${insp.stdout.trim()}`);
+    await log(`✓ Réseau '${netName}' actif → ${(insp.stdout || "").trim()}`);
     return {
       action: "network_set_subnet", ok: true, network: netName, subnet,
       gateway: gateway || null, ip_range: ipRange || null, mtu: mtu ?? null,
-      dns, container_ips: containerIps, applied: insp.stdout.trim(),
+      dns, container_ips: containerIps, applied: (insp.stdout || "").trim(),
     };
   } finally {
     try { conn.end(); } catch (_) {}
@@ -3313,8 +3333,8 @@ async function runNetworkSetHostname(body: DeployBody, log: (m: string) => Promi
     if (r2.stdout) await log(r2.stdout);
 
     const cur = await exec(conn, "hostname && hostname -f 2>/dev/null || true");
-    await log(`✓ Hostname actuel: ${cur.stdout.trim()}`);
-    return { action: "network_set_hostname", ok: true, hostname, alias: alias || null, current: cur.stdout.trim() };
+    await log(`✓ Hostname actuel: ${(cur.stdout || "").trim()}`);
+    return { action: "network_set_hostname", ok: true, hostname, alias: alias || null, current: (cur.stdout || "").trim() };
   } finally {
     try { conn.end(); } catch (_) {}
   }
@@ -3358,15 +3378,15 @@ async function runNetworkSetContainerIp(body: DeployBody & { network_name?: stri
   try {
     // Resolve real container name from id (works with both)
     const resolve = await exec(conn, `docker inspect --format '{{.Name}}' ${target} 2>&1 | sed 's#^/##'`);
-    if (resolve.code !== 0 || !resolve.stdout.trim()) {
+    if (resolve.code !== 0 || !(resolve.stdout || "").trim()) {
       throw new Error(`Conteneur introuvable: ${target} (${resolve.stderr || resolve.stdout})`);
     }
-    const cname = resolve.stdout.trim();
+    const cname = (resolve.stdout || "").trim();
     await log(`  • Conteneur résolu: ${cname}`);
 
     // Verify the network exists
     const netCheck = await exec(conn, `docker network inspect ${netName} --format 'OK' 2>&1`);
-    if (!netCheck.stdout.includes("OK")) {
+    if (!(netCheck.stdout || "").includes("OK")) {
       throw new Error(`Réseau Docker introuvable: ${netName}`);
     }
 
@@ -3383,7 +3403,7 @@ async function runNetworkSetContainerIp(body: DeployBody & { network_name?: stri
 
     // Confirm new IP
     const verify = await exec(conn, `docker inspect ${cname} --format '{{(index .NetworkSettings.Networks "${netName}").IPAddress}}' 2>&1`);
-    const appliedIp = verify.stdout.trim();
+    const appliedIp = (verify.stdout || "").trim();
     await log(`✓ IP appliquée en direct: ${appliedIp}`);
 
     return {

@@ -1275,9 +1275,11 @@ async function runDeploymentJob(
     const result = directResult ?? (globalThis as any).__lastDeployResult ?? null;
     await persist({ status: "success", logs, result });
   } catch (e: any) {
-    logs.push("✗ ERROR: " + (e?.message || String(e)));
-    await persist({ status: "error", logs, error: e?.message || String(e) });
+    const detail = `${e?.message || String(e)}${e?.stack ? ` | ${String(e.stack).split("\n").slice(0, 4).join(" ⏎ ")}` : ""}`;
+    logs.push("✗ ERROR: " + detail);
+    await persist({ status: "error", logs, error: detail });
   }
+
 }
 
 Deno.serve(async (req) => {

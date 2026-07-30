@@ -1617,7 +1617,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
           `DISABLE_SIGNUP=false`,
         ].join("\n") + "\n";
         const envB64 = btoa(envPatch);
-        await exec(conn, `cd ${supaDir} && for k in POSTGRES_PASSWORD JWT_SECRET ANON_KEY SERVICE_ROLE_KEY SUPABASE_PUBLISHABLE_KEY SUPABASE_SECRET_KEY DASHBOARD_USERNAME DASHBOARD_PASSWORD SITE_URL API_EXTERNAL_URL SUPABASE_PUBLIC_URL KONG_HTTP_PORT KONG_HTTPS_PORT STUDIO_PORT POSTGRES_PORT ENABLE_EMAIL_SIGNUP ENABLE_EMAIL_AUTOCONFIRM ENABLE_ANONYMOUS_USERS DISABLE_SIGNUP; do sed -i "/^$k=/d" .env; done && echo "${envB64}" | base64 -d >> .env && serviceKey="${serviceKey}" && echo "_OK"`);
+        await exec(conn, `cd ${supaDir} && for k in POSTGRES_PASSWORD JWT_SECRET ANON_KEY SERVICE_ROLE_KEY SUPABASE_PUBLISHABLE_KEY SUPABASE_SECRET_KEY DASHBOARD_USERNAME DASHBOARD_PASSWORD SITE_URL API_EXTERNAL_URL GOTRUE_EXTERNAL_URL ADDITIONAL_REDIRECT_URLS SUPABASE_PUBLIC_URL KONG_HTTP_PORT KONG_HTTPS_PORT STUDIO_PORT POSTGRES_PORT ENABLE_EMAIL_SIGNUP ENABLE_EMAIL_AUTOCONFIRM ENABLE_ANONYMOUS_USERS DISABLE_SIGNUP; do sed -i "/^$k=/d" .env; done && echo "${envB64}" | base64 -d >> .env && serviceKey="${serviceKey}" && echo "_OK"`);
 
         log(`→ Starting Supabase containers essentiels (kong:${supaKongPort}, studio:${supaStudioPort}, db:${supaDbPort})…`);
         await syncLocalAuthSafeEnv(conn, supaDir, log);
@@ -1724,7 +1724,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
         await startLocalSupabaseEssentials(conn, supaDir, log, true);
         await ensureLocalApiServices(conn, supaDir, supaKongPort, anonKey, log);
         const supaBrowserUrl = resolveBrowserAppBase(body, appPort, enableHttps, httpsDomain, httpsPort);
-        await exec(conn, `cd ${supaDir} && for k in SITE_URL API_EXTERNAL_URL SUPABASE_PUBLIC_URL; do sed -i "/^$k=/d" .env; done && printf 'SITE_URL=%s\nAPI_EXTERNAL_URL=%s\nSUPABASE_PUBLIC_URL=%s\n' ${shQuote(supaBrowserUrl)} ${shQuote(supaBrowserUrl)} ${shQuote(supaBrowserUrl)} >> .env && docker compose restart auth storage rest kong 2>&1 || true`);
+        await exec(conn, `cd ${supaDir} && for k in SITE_URL API_EXTERNAL_URL GOTRUE_EXTERNAL_URL ADDITIONAL_REDIRECT_URLS SUPABASE_PUBLIC_URL; do sed -i "/^$k=/d" .env; done && printf 'SITE_URL=%s\nAPI_EXTERNAL_URL=%s\nGOTRUE_EXTERNAL_URL=%s/auth/v1\nADDITIONAL_REDIRECT_URLS=http://localhost:8080,http://127.0.0.1:8080,http://localhost:3000,http://%s:%s\nSUPABASE_PUBLIC_URL=%s\n' ${shQuote(supaBrowserUrl)} ${shQuote(supaBrowserUrl)} ${shQuote(supaBrowserUrl)} ${shQuote(body.host)} ${shQuote(appPort || '8080')} ${shQuote(supaBrowserUrl)} >> .env && docker compose restart auth storage rest kong 2>&1 || true`);
         supabaseUrlOverride = supaBrowserUrl;
         supabaseAnonOverride = anonKey;
         supabaseProjectIdOverride = "local";
@@ -2120,7 +2120,7 @@ else:
 p.write_text(s)
 PY`;
   await exec(conn, patchCompose);
-  await exec(conn, `cd ${supaDir} && for k in SITE_URL API_EXTERNAL_URL SUPABASE_PUBLIC_URL; do sed -i "/^$k=/d" .env; done && printf 'SITE_URL=%s\nAPI_EXTERNAL_URL=%s\nSUPABASE_PUBLIC_URL=%s\n' ${shQuote(publicBase)} ${shQuote(publicBase)} ${shQuote(publicBase)} >> .env && docker compose restart auth storage rest kong 2>&1 || true`);
+  await exec(conn, `cd ${supaDir} && for k in SITE_URL API_EXTERNAL_URL GOTRUE_EXTERNAL_URL ADDITIONAL_REDIRECT_URLS SUPABASE_PUBLIC_URL; do sed -i "/^$k=/d" .env; done && printf 'SITE_URL=%s\nAPI_EXTERNAL_URL=%s\nGOTRUE_EXTERNAL_URL=%s/auth/v1\nADDITIONAL_REDIRECT_URLS=http://localhost:8080,http://127.0.0.1:8080,http://localhost:3000,http://%s:%s\nSUPABASE_PUBLIC_URL=%s\n' ${shQuote(publicBase)} ${shQuote(publicBase)} ${shQuote(publicBase)} ${shQuote(body.host)} ${shQuote(body.app_port || '8080')} ${shQuote(publicBase)} >> .env && docker compose restart auth storage rest kong 2>&1 || true`);
   await exec(conn, `cd ${repoDir} && (docker compose up -d --build web || docker-compose up -d --build web) 2>&1`);
   // Vérification depuis le serveur via 127.0.0.1 (évite DNS public + cert auto-signé)
   const probe = await exec(conn, `curl -sS -m 10 -o /tmp/sf_proxy_bucket.txt -w "%{http_code}" ${shQuote(`http://127.0.0.1:${kongPort}/storage/v1/bucket`)} -H ${shQuote(`apikey: ${anonKey}`)} -H ${shQuote(`Authorization: Bearer ${anonKey}`)} 2>/dev/null || true`);

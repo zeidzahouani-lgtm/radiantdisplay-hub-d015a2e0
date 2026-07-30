@@ -74,10 +74,10 @@ const NGINX_CONF = `server {
 
   # Si VITE_SUPABASE_URL pointe vers le même domaine que l'app,
   # proxifiez ces routes vers Kong/Supabase local (port 8000 par défaut).
-  location /auth/v1/ { proxy_pass http://host.docker.internal:8000/auth/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; }
-  location /rest/v1/ { proxy_pass http://host.docker.internal:8000/rest/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; }
-  location /storage/v1/ { proxy_pass http://host.docker.internal:8000/storage/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; }
-  location /functions/v1/ { proxy_pass http://host.docker.internal:8000/functions/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; }
+  set $cors_origin $http_origin; if ($request_method = OPTIONS) { return 204; } location /auth/v1/ { proxy_pass http://host.docker.internal:8000/auth/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; add_header Access-Control-Allow-Origin $cors_origin always; }
+  location /rest/v1/ { proxy_pass http://host.docker.internal:8000/rest/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; add_header Access-Control-Allow-Origin $cors_origin always; }
+  location /storage/v1/ { proxy_pass http://host.docker.internal:8000/storage/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; add_header Access-Control-Allow-Origin $cors_origin always; client_max_body_size 1024m; }
+  location /functions/v1/ { proxy_pass http://host.docker.internal:8000/functions/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; add_header Access-Control-Allow-Origin $cors_origin always; }
   location /realtime/v1/ { proxy_pass http://host.docker.internal:8000/realtime/v1/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; }
 
   location /assets/ {

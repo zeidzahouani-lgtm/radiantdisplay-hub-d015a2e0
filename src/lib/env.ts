@@ -7,6 +7,11 @@ type EnvCheck = {
 };
 
 const rawEnv = import.meta.env as Record<string, string | undefined>;
+const SAME_ORIGIN_SUPABASE_MARKERS = new Set([
+  "__SCREENFLOW_SAME_ORIGIN__",
+  "same-origin",
+  "runtime:same-origin",
+]);
 
 function clean(value?: string) {
   return (value || "").trim();
@@ -21,8 +26,58 @@ export const appEnv = {
   appBasePath: clean(rawEnv.VITE_APP_BASE_PATH) || "/",
 };
 
+function getRuntimeOrigin() {
+  if (typeof window !== "undefined" && window.location?.origin) {
+    return window.location.origin.replace(/\/$/, "");
+  }
+  return "";
+}
+
+function normalizeUrl(value: string) {
+  return value.trim().replace(/\/$/, "");
+}
+
+function isSameOriginSupabaseMarker(value: string) {
+  return SAME_ORIGIN_SUPABASE_MARKERS.has(value.trim().toLowerCase()) || SAME_ORIGIN_SUPABASE_MARKERS.has(value.trim());
+}
+
+function hostnameFromUrl(value: string) {
+  try {
+    return new URL(value).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function isLocalNetworkHostname(hostname: string) {
+  const host = hostname.toLowerCase();
+  if (!host) return false;
+  if (host === "localhost" || host.endsWith(".local")) return true;
+  if (/^127\./.test(host) || host === "0.0.0.0") return true;
+  if (/^10\./.test(host) || /^192\.168\./.test(host)) return true;
+  const match172 = host.match(/^172\.(\d{1,2})\./);
+  if (match172) {
+    const second = Number.parseInt(match172[1], 10);
+    return second >= 16 && second <= 31;
+  }
+  return false;
+}
+
+function shouldUseRuntimeOrigin(configuredUrl: string) {
+  if (isSameOriginSupabaseMarker(configuredUrl)) return true;
+  const runtimeOrigin = getRuntimeOrigin();
+  if (!runtimeOrigin || appEnv.supabaseProjectId !== "local") return false;
+  const runtimeHost = hostnameFromUrl(runtimeOrigin);
+  const configuredHost = hostnameFromUrl(configuredUrl);
+  return isLocalNetworkHostname(runtimeHost) && runtimeHost !== configuredHost;
+}
+
 export function getSupabaseUrl() {
-  return appEnv.supabaseUrl.replace(/\/$/, "");
+  const configured = appEnv.supabaseUrl;
+  if (shouldUseRuntimeOrigin(configured)) {
+    return getRuntimeOrigin();
+  }
+  return normalizeUrl(configured);
 }
 
 export function getSupabasePublishableKey() {
@@ -52,11 +107,19 @@ export function getAppBasePath() {
  *   2. window.location.origin (runtime fallback navigateur)
  */
 export function getPublicAppUrl() {
-  if (appEnv.publicAppUrl) {
-    return appEnv.publicAppUrl.replace(/\/$/, "");
+  const runtimeOrigin = getRuntimeOrigin();
+  const runtimeHost = hostnameFromUrl(runtimeOrigin);
+  const configuredHost = hostnameFromUrl(appEnv.publicAppUrl);
+
+  if (appEnv.supabaseProjectId === "local" && isLocalNetworkHostname(runtimeHost) && runtimeOrigin && runtimeHost !== configuredHost) {
+    return runtimeOrigin;
   }
-  if (typeof window !== "undefined" && window.location?.origin) {
-    return window.location.origin.replace(/\/$/, "");
+
+  if (appEnv.publicAppUrl) {
+    return normalizeUrl(appEnv.publicAppUrl);
+  }
+  if (runtimeOrigin) {
+    return runtimeOrigin;
   }
   return "";
 }
@@ -74,15 +137,16 @@ export function buildAppUrl(path: string) {
 
 export function getLocalEnvChecks(): EnvCheck[] {
   const url = appEnv.supabaseUrl;
+  const resolvedUrl = getSupabaseUrl();
   const key = appEnv.supabasePublishableKey;
 
   return [
     {
       name: "VITE_SUPABASE_URL",
-      value: url,
+      value: isSameOriginSupabaseMarker(url) ? `${url} → ${resolvedUrl || "origin navigateur"}` : url,
       required: true,
-      ok: /^https?:\/\/.+/.test(url),
-      hint: "Doit pointer vers l'API Supabase accessible par le navigateur local, ex: http://IP_SERVEUR:8080 ou http://IP_SERVEUR:8000.",
+      ok: isSameOriginSupabaseMarker(url) || /^https?:\/\/.+/.test(resolvedUrl),
+      hint: "Doit pointer vers l'API backend accessible par le navigateur local, ou utiliser __SCREENFLOW_SAME_ORIGIN__ pour le proxy local/distant.",
     },
     {
       name: "VITE_SUPABASE_PUBLISHABLE_KEY",
@@ -206,7 +270,7 @@ export function explainSupabaseError(error: unknown, context = "Supabase") {
     hint: anyError?.hint,
     status: anyError?.status,
     action,
-    supabaseUrl: appEnv.supabaseUrl || "missing",
+    supabaseUrl: getSupabaseUrl() || appEnv.supabaseUrl || "missing",
   });
 
   return { cause, action, message };

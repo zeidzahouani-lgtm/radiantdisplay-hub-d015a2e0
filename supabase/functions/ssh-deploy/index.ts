@@ -215,6 +215,123 @@ function resolveBrowserAppBase(body: DeployBody, appPort: string, enableHttps = 
   return enableHttps ? `https://${host}:${httpsPort || "8443"}` : `http://${host}:${appPort}`;
 }
 
+function cleanHostForUrl(value?: string) {
+  const raw = (value || "").trim();
+  if (!raw) return "";
+  try {
+    return new URL(raw.includes("://") ? raw : `http://${raw}`).hostname;
+  } catch {
+    return raw.replace(/^https?:\/\//, "").split("/")[0].split(":")[0];
+  }
+}
+
+function appendOrigin(target: Set<string>, protocol: "http" | "https", host: string, port: string) {
+  const cleanHost = cleanHostForUrl(host);
+  if (!cleanHost) return;
+  const defaultPort = (protocol === "http" && port === "80") || (protocol === "https" && port === "443");
+  target.add(defaultPort ? `${protocol}://${cleanHost}` : `${protocol}://${cleanHost}:${port}`);
+  target.add(`${protocol}://${cleanHost}:${port}`);
+}
+
+function buildLocalRedirectUrls(body: DeployBody, appPort: string, publicBase: string, enableHttps = false, httpsDomain?: string, httpsPort?: string) {
+  const urls = new Set<string>([
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+    "http://localhost:3000",
+  ]);
+  try {
+    urls.add(new URL(publicBase).origin.replace(/\/$/, ""));
+  } catch {}
+  appendOrigin(urls, "http", body.host, appPort);
+  appendOrigin(urls, "http", body.local_ip || "127.0.0.1", appPort);
+  if (enableHttps) {
+    appendOrigin(urls, "https", httpsDomain || body.host, httpsPort || "443");
+    appendOrigin(urls, "https", body.host, httpsPort || "443");
+  }
+  return Array.from(urls).filter(Boolean).join(",");
+}
+
+function buildLocalAuthUrlEnvPatch(body: DeployBody, appPort: string, publicBase: string, enableHttps = false, httpsDomain?: string, httpsPort?: string) {
+  const redirectUrls = buildLocalRedirectUrls(body, appPort, publicBase, enableHttps, httpsDomain, httpsPort);
+  return [
+    `SITE_URL=${publicBase}`,
+    `API_EXTERNAL_URL=${publicBase}`,
+    `GOTRUE_EXTERNAL_URL=${publicBase}/auth/v1`,
+    `SUPABASE_PUBLIC_URL=${publicBase}`,
+    `ADDITIONAL_REDIRECT_URLS=${redirectUrls}`,
+  ].join("\n") + "\n";
+}
+
+function buildRuntimeSupabaseClientHotfix() {
+  return `// Runtime client used by ScreenFlow SSH repair: keep backend calls on the current app origin for local LAN access.
+import { createClient } from '@supabase/supabase-js';
+import type { Database } from './types';
+
+const configuredUrl = (import.meta.env.VITE_SUPABASE_URL || '').trim().replace(/\/$/, '');
+const publishableKey = (import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY || '').trim();
+const projectId = (import.meta.env.VITE_SUPABASE_PROJECT_ID || '').trim();
+
+function runtimeOrigin() {
+  if (typeof window !== 'undefined' && window.location?.origin) return window.location.origin.replace(/\/$/, '');
+  return '';
+}
+
+function hostOf(value: string) {
+  try { return new URL(value).hostname.toLowerCase(); } catch { return ''; }
+}
+
+function isLanHost(hostname: string) {
+  const host = hostname.toLowerCase();
+  if (!host) return false;
+  if (host === 'localhost' || host.endsWith('.local') || /^127\./.test(host)) return true;
+  if (/^10\./.test(host) || /^192\.168\./.test(host)) return true;
+  const m = host.match(/^172\.(\d{1,2})\./);
+  if (!m) return false;
+  const n = Number.parseInt(m[1], 10);
+  return n >= 16 && n <= 31;
+}
+
+function resolveSupabaseUrl() {
+  const origin = runtimeOrigin();
+  const marker = configuredUrl === '__SCREENFLOW_SAME_ORIGIN__' || configuredUrl === 'same-origin' || configuredUrl === 'runtime:same-origin';
+  if (marker && origin) return origin;
+  if (projectId === 'local' && origin && isLanHost(hostOf(origin)) && hostOf(origin) !== hostOf(configuredUrl)) return origin;
+  return configuredUrl;
+}
+
+export const supabase = createClient<Database>(resolveSupabaseUrl(), publishableKey, {
+  auth: {
+    storage: localStorage,
+    persistSession: true,
+    autoRefreshToken: true,
+  },
+});
+`;
+}
+
+async function patchRemoteRuntimeSupabaseClient(conn: Client, repoDir: string, log: (m: string) => Promise<void> | void) {
+  await exec(conn, `mkdir -p ${repoDir}/src/integrations/supabase`);
+  await uploadFile(conn, `${repoDir}/src/integrations/supabase/runtime-client.ts`, Buffer.from(buildRuntimeSupabaseClientHotfix()));
+  const vitePatch = `python3 - <<'PY'
+from pathlib import Path
+p = Path(${JSON.stringify(`${repoDir}/vite.config.ts`)})
+s = p.read_text()
+if 'src/integrations/supabase/runtime-client.ts' not in s:
+    object_anchor = 'alias: {'
+    src_alias = '"@": path.resolve(__dirname, "./src"),'
+    if object_anchor in s and src_alias in s:
+        s = s.replace(src_alias, '"@/integrations/supabase/client": path.resolve(__dirname, "./src/integrations/supabase/runtime-client.ts"),\n        ' + src_alias, 1)
+    elif 'alias: [' in s:
+        s = s.replace('alias: [', 'alias: [\n        { find: "@/integrations/supabase/client", replacement: path.resolve(__dirname, "./src/integrations/supabase/runtime-client.ts") },', 1)
+    else:
+        raise SystemExit('vite alias block not found')
+    p.write_text(s)
+print('OK')
+PY`;
+  await exec(conn, vitePatch);
+  await log("✓ Client backend runtime ajouté : accès local LAN → appels API sur la même adresse");
+}
+
 function dockerPsql(connDir: string, sqlB64: string, onErrorStop = true) {
   const psql = `PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=${onErrorStop ? 1 : 0}`;
   return `cd ${connDir} && printf '%s' '${sqlB64}' | base64 -d | docker compose exec -T --user postgres db sh -lc ${shQuote(psql)} 2>&1`;
@@ -1602,9 +1719,6 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
           `SUPABASE_SECRET_KEY=`,
           `DASHBOARD_USERNAME=admin`,
           `DASHBOARD_PASSWORD=${dashboardPw}`,
-          `SITE_URL=${supaBrowserUrl}`,
-          `API_EXTERNAL_URL=${supaBrowserUrl}`,
-          `SUPABASE_PUBLIC_URL=${supaBrowserUrl}`,
           `KONG_HTTP_PORT=${supaKongPort}`,
           `KONG_HTTPS_PORT=${supaKongHttpsPort}`,
           `STUDIO_PORT=${supaStudioPort}`,
@@ -1613,9 +1727,9 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
           `ENABLE_EMAIL_AUTOCONFIRM=true`,
           `ENABLE_ANONYMOUS_USERS=false`,
           `DISABLE_SIGNUP=false`,
-        ].join("\n") + "\n";
+        ].join("\n") + "\n" + buildLocalAuthUrlEnvPatch(body, appPort, supaBrowserUrl, enableHttps, httpsDomain, httpsPort);
         const envB64 = btoa(envPatch);
-        await exec(conn, `cd ${supaDir} && for k in POSTGRES_PASSWORD JWT_SECRET ANON_KEY SERVICE_ROLE_KEY SUPABASE_PUBLISHABLE_KEY SUPABASE_SECRET_KEY DASHBOARD_USERNAME DASHBOARD_PASSWORD SITE_URL API_EXTERNAL_URL SUPABASE_PUBLIC_URL KONG_HTTP_PORT KONG_HTTPS_PORT STUDIO_PORT POSTGRES_PORT ENABLE_EMAIL_SIGNUP ENABLE_EMAIL_AUTOCONFIRM ENABLE_ANONYMOUS_USERS DISABLE_SIGNUP; do sed -i "/^$k=/d" .env; done && echo "${envB64}" | base64 -d >> .env && serviceKey="${serviceKey}" && echo "_OK"`);
+        await exec(conn, `cd ${supaDir} && for k in POSTGRES_PASSWORD JWT_SECRET ANON_KEY SERVICE_ROLE_KEY SUPABASE_PUBLISHABLE_KEY SUPABASE_SECRET_KEY DASHBOARD_USERNAME DASHBOARD_PASSWORD SITE_URL API_EXTERNAL_URL GOTRUE_EXTERNAL_URL ADDITIONAL_REDIRECT_URLS SUPABASE_PUBLIC_URL KONG_HTTP_PORT KONG_HTTPS_PORT STUDIO_PORT POSTGRES_PORT ENABLE_EMAIL_SIGNUP ENABLE_EMAIL_AUTOCONFIRM ENABLE_ANONYMOUS_USERS DISABLE_SIGNUP; do sed -i "/^$k=/d" .env; done && echo "${envB64}" | base64 -d >> .env && serviceKey="${serviceKey}" && echo "_OK"`);
 
         log(`→ Starting Supabase containers essentiels (kong:${supaKongPort}, studio:${supaStudioPort}, db:${supaDbPort})…`);
         await syncLocalAuthSafeEnv(conn, supaDir, log);
@@ -1722,7 +1836,8 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
         await startLocalSupabaseEssentials(conn, supaDir, log, true);
         await ensureLocalApiServices(conn, supaDir, supaKongPort, anonKey, log);
         const supaBrowserUrl = resolveBrowserAppBase(body, appPort, enableHttps, httpsDomain, httpsPort);
-        await exec(conn, `cd ${supaDir} && for k in SITE_URL API_EXTERNAL_URL SUPABASE_PUBLIC_URL; do sed -i "/^$k=/d" .env; done && printf 'SITE_URL=%s\nAPI_EXTERNAL_URL=%s\nSUPABASE_PUBLIC_URL=%s\n' ${shQuote(supaBrowserUrl)} ${shQuote(supaBrowserUrl)} ${shQuote(supaBrowserUrl)} >> .env && docker compose restart auth storage rest kong 2>&1 || true`);
+        const existingAuthEnvB64 = btoa(buildLocalAuthUrlEnvPatch(body, appPort, supaBrowserUrl, enableHttps, httpsDomain, httpsPort));
+        await exec(conn, `cd ${supaDir} && for k in SITE_URL API_EXTERNAL_URL GOTRUE_EXTERNAL_URL ADDITIONAL_REDIRECT_URLS SUPABASE_PUBLIC_URL; do sed -i "/^$k=/d" .env; done && printf '%s' '${existingAuthEnvB64}' | base64 -d >> .env && docker compose restart auth storage rest kong 2>&1 || true`);
         supabaseUrlOverride = supaBrowserUrl;
         supabaseAnonOverride = anonKey;
         supabaseProjectIdOverride = "local";
@@ -1822,13 +1937,13 @@ CMD ["nginx","-g","daemon off;"]
     return 204;
   }`;
 
-      const functionProxyHeaders = `proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Host $host; proxy_set_header X-Forwarded-Proto ${enableHttps ? "https" : "http"}; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`;
+      const functionProxyHeaders = `proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Host $host; proxy_set_header X-Forwarded-Proto ${enableHttps ? "https" : "http"}; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host;`;
       const localFunctionLocations = localFunctions.map((name) => `  location = /functions/v1/${name} { ${corsHidesAndAdds} proxy_pass http://host.docker.internal:${supaKongPort}/functions/v1/${name}; ${functionProxyHeaders} }`).join("\n");
 
       // Common proxy snippet shared by all Supabase upstream locations.
       // CRITICAL: client_max_body_size must be large enough for media uploads (videos can be hundreds of MB).
       // proxy_request_buffering off allows streaming large uploads to Kong/Storage without buffering to disk first.
-      const commonProxyHeaders = (proto: string) => `${corsHidesAndAdds} proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert; proxy_set_header Content-Type $http_content_type; proxy_set_header X-Forwarded-Proto ${proto}; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`;
+      const commonProxyHeaders = (proto: string) => `${corsHidesAndAdds} proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto ${proto}; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host;`;
       const storageProxy = (proto: string) => `proxy_pass http://host.docker.internal:${supaKongPort}/storage/v1/; ${commonProxyHeaders(proto)} client_max_body_size 1024m; proxy_request_buffering off; proxy_buffering off; proxy_read_timeout 3600s; proxy_send_timeout 3600s;`;
       const restProxy = (proto: string) => `proxy_pass http://host.docker.internal:${supaKongPort}/rest/v1/; ${commonProxyHeaders(proto)} client_max_body_size 50m;`;
       const authProxy = (proto: string) => `proxy_pass http://host.docker.internal:${supaKongPort}/auth/v1/; ${commonProxyHeaders(proto)} client_max_body_size 10m;`;
@@ -1906,6 +2021,7 @@ ${portsBlock}
       await uploadFile(conn, `${remoteDir}/repo/Dockerfile`, Buffer.from(dockerfile));
       await uploadFile(conn, `${remoteDir}/repo/nginx.conf`, Buffer.from(nginxConf));
       await uploadFile(conn, `${remoteDir}/repo/docker-compose.yml`, Buffer.from(compose));
+      await patchRemoteRuntimeSupabaseClient(conn, `${remoteDir}/repo`, log);
       log("✓ Build files ready");
 
       if (enableHttps) {
@@ -2087,17 +2203,18 @@ server {
     add_header Content-Length 0 always;
     return 204;
   }
-  location /auth/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/auth/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert; proxy_set_header Content-Type $http_content_type; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
-  location /rest/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/rest/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert; proxy_set_header Content-Type $http_content_type; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; client_max_body_size 50m; }
-  location /storage/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/storage/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert; proxy_set_header Content-Type $http_content_type; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; client_max_body_size 1024m; proxy_request_buffering off; proxy_buffering off; proxy_read_timeout 3600s; proxy_send_timeout 3600s; }
-  location /functions/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/functions/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
-  location /realtime/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/realtime/v1/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_read_timeout 3600s; proxy_send_timeout 3600s; }
+  location /auth/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/auth/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; }
+  location /rest/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/rest/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; client_max_body_size 50m; }
+  location /storage/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/storage/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; client_max_body_size 1024m; proxy_request_buffering off; proxy_buffering off; proxy_read_timeout 3600s; proxy_send_timeout 3600s; }
+  location /functions/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/functions/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; }
+  location /realtime/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/realtime/v1/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; proxy_read_timeout 3600s; proxy_send_timeout 3600s; }
   location /assets/ { expires 1y; add_header Cache-Control "public, immutable"; }
   location / { try_files $uri $uri/ /index.html; }
 }
 `;
 
   await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(nginxConf));
+  await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
   const patchCompose = `python3 - <<'PY'
 import base64, pathlib, re
 p = pathlib.Path(${JSON.stringify(`${repoDir}/docker-compose.yml`)})
@@ -2118,7 +2235,8 @@ else:
 p.write_text(s)
 PY`;
   await exec(conn, patchCompose);
-  await exec(conn, `cd ${supaDir} && for k in SITE_URL API_EXTERNAL_URL SUPABASE_PUBLIC_URL; do sed -i "/^$k=/d" .env; done && printf 'SITE_URL=%s\nAPI_EXTERNAL_URL=%s\nSUPABASE_PUBLIC_URL=%s\n' ${shQuote(publicBase)} ${shQuote(publicBase)} ${shQuote(publicBase)} >> .env && docker compose restart auth storage rest kong 2>&1 || true`);
+  const repairAuthEnvB64 = btoa(buildLocalAuthUrlEnvPatch(body, appPort, publicBase));
+  await exec(conn, `cd ${supaDir} && for k in SITE_URL API_EXTERNAL_URL GOTRUE_EXTERNAL_URL ADDITIONAL_REDIRECT_URLS SUPABASE_PUBLIC_URL; do sed -i "/^$k=/d" .env; done && printf '%s' '${repairAuthEnvB64}' | base64 -d >> .env && docker compose restart auth storage rest kong 2>&1 || true`);
   await exec(conn, `cd ${repoDir} && (docker compose up -d --build web || docker-compose up -d --build web) 2>&1`);
   // Vérification depuis le serveur via 127.0.0.1 (évite DNS public + cert auto-signé)
   const probe = await exec(conn, `curl -sS -m 10 -o /tmp/sf_proxy_bucket.txt -w "%{http_code}" ${shQuote(`http://127.0.0.1:${kongPort}/storage/v1/bucket`)} -H ${shQuote(`apikey: ${anonKey}`)} -H ${shQuote(`Authorization: Bearer ${anonKey}`)} 2>/dev/null || true`);
@@ -2151,11 +2269,11 @@ server {
     add_header Content-Length 0 always;
     return 204;
   }
-  location /auth/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/auth/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert; proxy_set_header Content-Type $http_content_type; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
-  location /rest/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/rest/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert; proxy_set_header Content-Type $http_content_type; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; client_max_body_size 50m; }
-  location /storage/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/storage/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert; proxy_set_header Content-Type $http_content_type; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; client_max_body_size 1024m; proxy_request_buffering off; proxy_buffering off; proxy_read_timeout 3600s; proxy_send_timeout 3600s; }
-  location /functions/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/functions/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
-  location /realtime/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/realtime/v1/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_read_timeout 3600s; proxy_send_timeout 3600s; }
+  location /auth/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/auth/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; }
+  location /rest/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/rest/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; client_max_body_size 50m; }
+  location /storage/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/storage/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; client_max_body_size 1024m; proxy_request_buffering off; proxy_buffering off; proxy_read_timeout 3600s; proxy_send_timeout 3600s; }
+  location /functions/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/functions/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; }
+  location /realtime/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/realtime/v1/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; proxy_read_timeout 3600s; proxy_send_timeout 3600s; }
   location /assets/ { expires 1y; add_header Cache-Control "public, immutable"; }
   location / { try_files $uri $uri/ /index.html; }
 }

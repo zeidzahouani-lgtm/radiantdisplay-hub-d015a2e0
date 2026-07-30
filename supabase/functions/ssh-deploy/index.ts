@@ -2292,11 +2292,23 @@ async function repairUploadsNowCore(conn: Client, body: DeployBody, log: (m: str
   await exec(conn, `cd ${supaDir} && (docker compose restart storage rest kong 2>&1 || docker-compose restart storage rest kong 2>&1 || true)`);
   await ensureLocalApiServices(conn, supaDir, kongPort, anonKey, log);
 
+  // Cause n°1 des HTTP 502 sur /storage/v1 : le conteneur storage est mort (upstream refusé par Kong).
+  const storageService = await recoverStorageContainer(conn, supaDir, kongPort, anonKey, log);
+  await ensureWebContainerRunning(conn, `${remoteDir}/repo`, log);
+
   await log("→ Tests d'upload directs sur le backend local…");
-  const storageTests = [
+  let storageTests = [
     await verifyStorageUploadAtBase(conn, supaDir, `http://127.0.0.1:${kongPort}`, anonKey, "uploads", "backend_direct"),
     await verifyStorageUploadAtBase(conn, supaDir, `http://127.0.0.1:${kongPort}`, anonKey, "media", "backend_direct"),
   ];
+  // Un 502/503 signifie que storage n'a pas fini de démarrer : on retente une fois après récupération.
+  if (storageTests.some((t) => /^(50\d|000)$/.test(t.status))) {
+    await recoverStorageContainer(conn, supaDir, kongPort, anonKey, log);
+    storageTests = [
+      await verifyStorageUploadAtBase(conn, supaDir, `http://127.0.0.1:${kongPort}`, anonKey, "uploads", "backend_direct"),
+      await verifyStorageUploadAtBase(conn, supaDir, `http://127.0.0.1:${kongPort}`, anonKey, "media", "backend_direct"),
+    ];
+  }
   for (const test of storageTests) {
     await log(`${test.ok ? "✓" : "✗"} Test ${test.label}/${test.bucket} → HTTP ${test.status}${test.detail ? ` (${test.detail})` : ""}`);
   }
@@ -2304,7 +2316,8 @@ async function repairUploadsNowCore(conn: Client, body: DeployBody, log: (m: str
   const proxy = await patchRunningWebProxyForUploads(conn, body, kongPort, anonKey, supaDir, log);
   const url = resolveBrowserAppBase(body, body.app_port || "8080");
   const ok = storageTests.every((test) => test.ok) && (proxy.ok || proxy.skipped);
-  const result = { action: "repair_uploads_now", ok, url, storage_tests: storageTests, proxy, supabase_local: { url, anon_key: anonKey } };
+  const result = { action: "repair_uploads_now", ok, url, storage_service: storageService, storage_tests: storageTests, proxy, supabase_local: { url, anon_key: anonKey } };
+
   await log(ok
     ? "✓ Uploads bibliothèque + QR corrigés. Rechargez l'application locale puis retestez."
     : "⚠ Réparation appliquée mais un test d'upload échoue encore — copiez le journal ci-dessus pour identifier le blocage exact.");

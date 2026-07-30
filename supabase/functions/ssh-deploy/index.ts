@@ -263,7 +263,7 @@ function buildLocalAuthUrlEnvPatch(body: DeployBody, appPort: string, publicBase
 }
 
 function buildRuntimeSupabaseClientHotfix() {
-  return `// Runtime-patched by ScreenFlow SSH repair: keep backend calls on the current app origin for local LAN access.
+  return `// Runtime client used by ScreenFlow SSH repair: keep backend calls on the current app origin for local LAN access.
 import { createClient } from '@supabase/supabase-js';
 import type { Database } from './types';
 
@@ -311,8 +311,25 @@ export const supabase = createClient<Database>(resolveSupabaseUrl(), publishable
 
 async function patchRemoteRuntimeSupabaseClient(conn: Client, repoDir: string, log: (m: string) => Promise<void> | void) {
   await exec(conn, `mkdir -p ${repoDir}/src/integrations/supabase`);
-  await uploadFile(conn, `${repoDir}/src/integrations/supabase/client.ts`, Buffer.from(buildRuntimeSupabaseClientHotfix()));
-  await log("✓ Client backend runtime patché : accès local LAN → appels API sur la même adresse");
+  await uploadFile(conn, `${repoDir}/src/integrations/supabase/runtime-client.ts`, Buffer.from(buildRuntimeSupabaseClientHotfix()));
+  const vitePatch = `python3 - <<'PY'
+from pathlib import Path
+p = Path(${JSON.stringify(`${repoDir}/vite.config.ts`)})
+s = p.read_text()
+if 'src/integrations/supabase/runtime-client.ts' not in s:
+    object_anchor = 'alias: {'
+    src_alias = '"@": path.resolve(__dirname, "./src"),'
+    if object_anchor in s and src_alias in s:
+        s = s.replace(src_alias, '"@/integrations/supabase/client": path.resolve(__dirname, "./src/integrations/supabase/runtime-client.ts"),\n        ' + src_alias, 1)
+    elif 'alias: [' in s:
+        s = s.replace('alias: [', 'alias: [\n        { find: "@/integrations/supabase/client", replacement: path.resolve(__dirname, "./src/integrations/supabase/runtime-client.ts") },', 1)
+    else:
+        raise SystemExit('vite alias block not found')
+    p.write_text(s)
+print('OK')
+PY`;
+  await exec(conn, vitePatch);
+  await log("✓ Client backend runtime ajouté : accès local LAN → appels API sur la même adresse");
 }
 
 function dockerPsql(connDir: string, sqlB64: string, onErrorStop = true) {

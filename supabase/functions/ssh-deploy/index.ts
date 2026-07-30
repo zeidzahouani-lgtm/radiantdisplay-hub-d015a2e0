@@ -215,6 +215,53 @@ function resolveBrowserAppBase(body: DeployBody, appPort: string, enableHttps = 
   return enableHttps ? `https://${host}:${httpsPort || "8443"}` : `http://${host}:${appPort}`;
 }
 
+function cleanHostForUrl(value?: string) {
+  const raw = (value || "").trim();
+  if (!raw) return "";
+  try {
+    return new URL(raw.includes("://") ? raw : `http://${raw}`).hostname;
+  } catch {
+    return raw.replace(/^https?:\/\//, "").split("/")[0].split(":")[0];
+  }
+}
+
+function appendOrigin(target: Set<string>, protocol: "http" | "https", host: string, port: string) {
+  const cleanHost = cleanHostForUrl(host);
+  if (!cleanHost) return;
+  const defaultPort = (protocol === "http" && port === "80") || (protocol === "https" && port === "443");
+  target.add(defaultPort ? `${protocol}://${cleanHost}` : `${protocol}://${cleanHost}:${port}`);
+  target.add(`${protocol}://${cleanHost}:${port}`);
+}
+
+function buildLocalRedirectUrls(body: DeployBody, appPort: string, publicBase: string, enableHttps = false, httpsDomain?: string, httpsPort?: string) {
+  const urls = new Set<string>([
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+    "http://localhost:3000",
+  ]);
+  try {
+    urls.add(new URL(publicBase).origin.replace(/\/$/, ""));
+  } catch {}
+  appendOrigin(urls, "http", body.host, appPort);
+  appendOrigin(urls, "http", body.local_ip || "127.0.0.1", appPort);
+  if (enableHttps) {
+    appendOrigin(urls, "https", httpsDomain || body.host, httpsPort || "443");
+    appendOrigin(urls, "https", body.host, httpsPort || "443");
+  }
+  return Array.from(urls).filter(Boolean).join(",");
+}
+
+function buildLocalAuthUrlEnvPatch(body: DeployBody, appPort: string, publicBase: string, enableHttps = false, httpsDomain?: string, httpsPort?: string) {
+  const redirectUrls = buildLocalRedirectUrls(body, appPort, publicBase, enableHttps, httpsDomain, httpsPort);
+  return [
+    `SITE_URL=${publicBase}`,
+    `API_EXTERNAL_URL=${publicBase}`,
+    `GOTRUE_EXTERNAL_URL=${publicBase}/auth/v1`,
+    `SUPABASE_PUBLIC_URL=${publicBase}`,
+    `ADDITIONAL_REDIRECT_URLS=${redirectUrls}`,
+  ].join("\n") + "\n";
+}
+
 function dockerPsql(connDir: string, sqlB64: string, onErrorStop = true) {
   const psql = `PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=${onErrorStop ? 1 : 0}`;
   return `cd ${connDir} && printf '%s' '${sqlB64}' | base64 -d | docker compose exec -T --user postgres db sh -lc ${shQuote(psql)} 2>&1`;
@@ -1602,10 +1649,6 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
           `SUPABASE_SECRET_KEY=`,
           `DASHBOARD_USERNAME=admin`,
           `DASHBOARD_PASSWORD=${dashboardPw}`,
-          `SITE_URL=${supaBrowserUrl}`,
-          `API_EXTERNAL_URL=${supaBrowserUrl}`,
-          `GOTRUE_EXTERNAL_URL=${supaBrowserUrl}/auth/v1`,
-          `SUPABASE_PUBLIC_URL=${supaBrowserUrl}`,
           `KONG_HTTP_PORT=${supaKongPort}`,
           `KONG_HTTPS_PORT=${supaKongHttpsPort}`,
           `STUDIO_PORT=${supaStudioPort}`,
@@ -1613,9 +1656,8 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
           `ENABLE_EMAIL_SIGNUP=true`,
           `ENABLE_EMAIL_AUTOCONFIRM=true`,
           `ENABLE_ANONYMOUS_USERS=false`,
-          `ADDITIONAL_REDIRECT_URLS=http://localhost:8080,http://127.0.0.1:8080,http://localhost:3000,http://${body.host}:${appPort},http://${body.local_ip || "127.0.0.1"}:${appPort}`,
           `DISABLE_SIGNUP=false`,
-        ].join("\n") + "\n";
+        ].join("\n") + "\n" + buildLocalAuthUrlEnvPatch(body, appPort, supaBrowserUrl, enableHttps, httpsDomain, httpsPort);
         const envB64 = btoa(envPatch);
         await exec(conn, `cd ${supaDir} && for k in POSTGRES_PASSWORD JWT_SECRET ANON_KEY SERVICE_ROLE_KEY SUPABASE_PUBLISHABLE_KEY SUPABASE_SECRET_KEY DASHBOARD_USERNAME DASHBOARD_PASSWORD SITE_URL API_EXTERNAL_URL GOTRUE_EXTERNAL_URL ADDITIONAL_REDIRECT_URLS SUPABASE_PUBLIC_URL KONG_HTTP_PORT KONG_HTTPS_PORT STUDIO_PORT POSTGRES_PORT ENABLE_EMAIL_SIGNUP ENABLE_EMAIL_AUTOCONFIRM ENABLE_ANONYMOUS_USERS DISABLE_SIGNUP; do sed -i "/^$k=/d" .env; done && echo "${envB64}" | base64 -d >> .env && serviceKey="${serviceKey}" && echo "_OK"`);
 
@@ -1724,7 +1766,8 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
         await startLocalSupabaseEssentials(conn, supaDir, log, true);
         await ensureLocalApiServices(conn, supaDir, supaKongPort, anonKey, log);
         const supaBrowserUrl = resolveBrowserAppBase(body, appPort, enableHttps, httpsDomain, httpsPort);
-        await exec(conn, `cd ${supaDir} && for k in SITE_URL API_EXTERNAL_URL GOTRUE_EXTERNAL_URL ADDITIONAL_REDIRECT_URLS SUPABASE_PUBLIC_URL; do sed -i "/^$k=/d" .env; done && printf 'SITE_URL=%s\nAPI_EXTERNAL_URL=%s\nGOTRUE_EXTERNAL_URL=%s/auth/v1\nADDITIONAL_REDIRECT_URLS=http://localhost:8080,http://127.0.0.1:8080,http://localhost:3000,http://%s:%s\nSUPABASE_PUBLIC_URL=%s\n' ${shQuote(supaBrowserUrl)} ${shQuote(supaBrowserUrl)} ${shQuote(supaBrowserUrl)} ${shQuote(body.host)} ${shQuote(appPort || '8080')} ${shQuote(supaBrowserUrl)} >> .env && docker compose restart auth storage rest kong 2>&1 || true`);
+        const existingAuthEnvB64 = btoa(buildLocalAuthUrlEnvPatch(body, appPort, supaBrowserUrl, enableHttps, httpsDomain, httpsPort));
+        await exec(conn, `cd ${supaDir} && for k in SITE_URL API_EXTERNAL_URL GOTRUE_EXTERNAL_URL ADDITIONAL_REDIRECT_URLS SUPABASE_PUBLIC_URL; do sed -i "/^$k=/d" .env; done && printf '%s' '${existingAuthEnvB64}' | base64 -d >> .env && docker compose restart auth storage rest kong 2>&1 || true`);
         supabaseUrlOverride = supaBrowserUrl;
         supabaseAnonOverride = anonKey;
         supabaseProjectIdOverride = "local";
@@ -2120,7 +2163,8 @@ else:
 p.write_text(s)
 PY`;
   await exec(conn, patchCompose);
-  await exec(conn, `cd ${supaDir} && for k in SITE_URL API_EXTERNAL_URL GOTRUE_EXTERNAL_URL ADDITIONAL_REDIRECT_URLS SUPABASE_PUBLIC_URL; do sed -i "/^$k=/d" .env; done && printf 'SITE_URL=%s\nAPI_EXTERNAL_URL=%s\nGOTRUE_EXTERNAL_URL=%s/auth/v1\nADDITIONAL_REDIRECT_URLS=http://localhost:8080,http://127.0.0.1:8080,http://localhost:3000,http://%s:%s\nSUPABASE_PUBLIC_URL=%s\n' ${shQuote(publicBase)} ${shQuote(publicBase)} ${shQuote(publicBase)} ${shQuote(body.host)} ${shQuote(body.app_port || '8080')} ${shQuote(publicBase)} >> .env && docker compose restart auth storage rest kong 2>&1 || true`);
+  const repairAuthEnvB64 = btoa(buildLocalAuthUrlEnvPatch(body, appPort, publicBase));
+  await exec(conn, `cd ${supaDir} && for k in SITE_URL API_EXTERNAL_URL GOTRUE_EXTERNAL_URL ADDITIONAL_REDIRECT_URLS SUPABASE_PUBLIC_URL; do sed -i "/^$k=/d" .env; done && printf '%s' '${repairAuthEnvB64}' | base64 -d >> .env && docker compose restart auth storage rest kong 2>&1 || true`);
   await exec(conn, `cd ${repoDir} && (docker compose up -d --build web || docker-compose up -d --build web) 2>&1`);
   // Vérification depuis le serveur via 127.0.0.1 (évite DNS public + cert auto-signé)
   const probe = await exec(conn, `curl -sS -m 10 -o /tmp/sf_proxy_bucket.txt -w "%{http_code}" ${shQuote(`http://127.0.0.1:${kongPort}/storage/v1/bucket`)} -H ${shQuote(`apikey: ${anonKey}`)} -H ${shQuote(`Authorization: Bearer ${anonKey}`)} 2>/dev/null || true`);

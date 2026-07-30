@@ -116,17 +116,35 @@ function ssh(opts: { host: string; port: number; username: string; password: str
 
 function exec(conn: Client, cmd: string): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    conn.exec(cmd, (err: any, stream: any) => {
-      if (err) return reject(err);
-      let stdout = "";
-      let stderr = "";
-      stream
-        .on("close", (code: number) => resolve({ code: code ?? 0, stdout, stderr }))
-        .on("data", (d: Buffer) => (stdout += d.toString()))
-        .stderr.on("data", (d: Buffer) => (stderr += d.toString()));
-    });
+    try {
+      conn.exec(cmd, (err: any, stream: any) => {
+        if (err) return reject(err);
+        if (!stream) return resolve({ code: 1, stdout: "", stderr: "no stream" });
+        let stdout = "";
+        let stderr = "";
+        let settled = false;
+        const done = (code: number) => {
+          if (settled) return;
+          settled = true;
+          resolve({ code: typeof code === "number" ? code : 0, stdout: stdout ?? "", stderr: stderr ?? "" });
+        };
+        stream.on("close", (code: number) => done(code));
+        stream.on("data", (d: any) => (stdout += String(d)));
+        if (stream.stderr && typeof stream.stderr.on === "function") {
+          stream.stderr.on("data", (d: any) => (stderr += String(d)));
+        }
+        stream.on("error", (e: any) => {
+          if (settled) return;
+          settled = true;
+          resolve({ code: 1, stdout: stdout ?? "", stderr: `${stderr ?? ""}${e?.message || String(e)}` });
+        });
+      });
+    } catch (e) {
+      reject(e);
+    }
   });
 }
+
 
 /**
  * Lance `docker compose up -d --build` en arrière-plan sur le serveur (nohup),

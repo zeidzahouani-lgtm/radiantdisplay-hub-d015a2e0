@@ -262,6 +262,59 @@ function buildLocalAuthUrlEnvPatch(body: DeployBody, appPort: string, publicBase
   ].join("\n") + "\n";
 }
 
+function buildRuntimeSupabaseClientHotfix() {
+  return `// Runtime-patched by ScreenFlow SSH repair: keep backend calls on the current app origin for local LAN access.
+import { createClient } from '@supabase/supabase-js';
+import type { Database } from './types';
+
+const configuredUrl = (import.meta.env.VITE_SUPABASE_URL || '').trim().replace(/\/$/, '');
+const publishableKey = (import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY || '').trim();
+const projectId = (import.meta.env.VITE_SUPABASE_PROJECT_ID || '').trim();
+
+function runtimeOrigin() {
+  if (typeof window !== 'undefined' && window.location?.origin) return window.location.origin.replace(/\/$/, '');
+  return '';
+}
+
+function hostOf(value: string) {
+  try { return new URL(value).hostname.toLowerCase(); } catch { return ''; }
+}
+
+function isLanHost(hostname: string) {
+  const host = hostname.toLowerCase();
+  if (!host) return false;
+  if (host === 'localhost' || host.endsWith('.local') || /^127\./.test(host)) return true;
+  if (/^10\./.test(host) || /^192\.168\./.test(host)) return true;
+  const m = host.match(/^172\.(\d{1,2})\./);
+  if (!m) return false;
+  const n = Number.parseInt(m[1], 10);
+  return n >= 16 && n <= 31;
+}
+
+function resolveSupabaseUrl() {
+  const origin = runtimeOrigin();
+  const marker = configuredUrl === '__SCREENFLOW_SAME_ORIGIN__' || configuredUrl === 'same-origin' || configuredUrl === 'runtime:same-origin';
+  if (marker && origin) return origin;
+  if (projectId === 'local' && origin && isLanHost(hostOf(origin)) && hostOf(origin) !== hostOf(configuredUrl)) return origin;
+  return configuredUrl;
+}
+
+export const supabase = createClient<Database>(resolveSupabaseUrl(), publishableKey, {
+  auth: {
+    storage: localStorage,
+    persistSession: true,
+    autoRefreshToken: true,
+  },
+});
+`;
+}
+
+async function patchRemoteRuntimeSupabaseClient(conn: Client, repoDir: string, log: (m: string) => Promise<void> | void) {
+  await exec(conn, `mkdir -p ${repoDir}/src/integrations/supabase`);
+  await uploadFile(conn, `${repoDir}/src/integrations/supabase/client.ts`, Buffer.from(buildRuntimeSupabaseClientHotfix()));
+  await log("✓ Client backend runtime patché : accès local LAN → appels API sur la même adresse");
+}
+
 function dockerPsql(connDir: string, sqlB64: string, onErrorStop = true) {
   const psql = `PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=${onErrorStop ? 1 : 0}`;
   return `cd ${connDir} && printf '%s' '${sqlB64}' | base64 -d | docker compose exec -T --user postgres db sh -lc ${shQuote(psql)} 2>&1`;

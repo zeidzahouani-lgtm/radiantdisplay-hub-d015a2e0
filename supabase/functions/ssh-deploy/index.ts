@@ -2217,7 +2217,63 @@ async function patchRunningWebProxyForUploads(conn: Client, body: DeployBody, ko
   return result;
 }
 
+async function recoverStorageContainer(conn: Client, supaDir: string, kongPort: string, anonKey: string, log: (m: string) => Promise<void> | void) {
+  const info: any = { ok: false, state: "", detail: "" };
+
+  const probe = async () => {
+    const r = await exec(conn, `curl -sS -m 6 -o /dev/null -w "%{http_code}" ${shQuote(`http://127.0.0.1:${kongPort}/storage/v1/bucket`)} -H ${shQuote(`apikey: ${anonKey}`)} -H ${shQuote(`Authorization: Bearer ${anonKey}`)} 2>/dev/null || true`);
+    return ((r.stdout || "").trim().match(/\d{3}/)?.[0]) || "000";
+  };
+
+  let code = await probe();
+  if (/^(2\d\d|401|403)$/.test(code)) {
+    info.ok = true;
+    info.state = `HTTP ${code}`;
+    return info;
+  }
+
+  await log(`⚠ Storage injoignable derrière Kong (HTTP ${code}) — récupération du conteneur storage…`);
+
+  const state = await exec(conn, `cd ${supaDir} && (docker compose ps storage 2>&1 | tail -3) ; echo '---LOGS---'; (docker compose logs --tail=60 storage 2>&1 || true)`);
+  const stateOut = `${state.stdout || ""}${state.stderr || ""}`;
+  info.state = stateOut.slice(-1500);
+  await log("• État/logs storage :\n" + info.state);
+
+  // Causes fréquentes : volume de fichiers non inscriptible, imgproxy absent, conteneur en crashloop.
+  await exec(conn, `cd ${supaDir} && mkdir -p volumes/storage volumes/db/data 2>/dev/null; chmod -R a+rwX volumes/storage 2>/dev/null || true; chown -R 1000:1000 volumes/storage 2>/dev/null || true`);
+  const recreate = await exec(conn, `cd ${supaDir} && (docker compose up -d --no-deps imgproxy 2>&1 || true); (docker compose up -d --no-deps --force-recreate storage 2>&1 || docker-compose up -d --no-deps --force-recreate storage 2>&1 || true)`);
+  await log((`${recreate.stdout || ""}${recreate.stderr || ""}`).slice(-800));
+
+  // Attente active que le service réponde (le storage met parfois ~30s à migrer son schéma).
+  for (let i = 0; i < 20; i++) {
+    code = await probe();
+    if (/^(2\d\d|401|403)$/.test(code)) {
+      info.ok = true;
+      info.state = `HTTP ${code}`;
+      await log(`✓ Service storage rétabli (HTTP ${code})`);
+      return info;
+    }
+    await exec(conn, `sleep 3`);
+  }
+
+  const after = await exec(conn, `cd ${supaDir} && docker compose logs --tail=60 storage 2>&1 || true`);
+  info.detail = (`${after.stdout || ""}${after.stderr || ""}`).slice(-1500);
+  await log(`✗ Le conteneur storage ne démarre toujours pas (HTTP ${code}). Dernières lignes :\n${info.detail}`);
+  return info;
+}
+
+async function ensureWebContainerRunning(conn: Client, repoDir: string, log: (m: string) => Promise<void> | void) {
+  const check = await exec(conn, `cd ${repoDir} 2>/dev/null && (docker compose ps -q web || docker-compose ps -q web) 2>/dev/null | head -1`);
+  if ((check.stdout || "").trim()) return true;
+  await log("→ Conteneur web absent : démarrage sans rebuild complet…");
+  const up = await exec(conn, `cd ${repoDir} && (docker compose up -d --no-deps web 2>&1 || docker-compose up -d --no-deps web 2>&1 || true)`);
+  await log((`${up.stdout || ""}${up.stderr || ""}`).slice(-800));
+  const again = await exec(conn, `cd ${repoDir} && (docker compose ps -q web || docker-compose ps -q web) 2>/dev/null | head -1`);
+  return Boolean((again.stdout || "").trim());
+}
+
 async function repairUploadsNowCore(conn: Client, body: DeployBody, log: (m: string) => Promise<void> | void) {
+
   const remoteDir = body.remote_dir || "/opt/screenflow";
   const supaDir = `${remoteDir}/supabase`;
   const supaPresent = (await exec(conn, `[ -f ${supaDir}/docker-compose.yml ] && echo OK || echo NO`)).stdout.includes("OK");
@@ -2236,11 +2292,23 @@ async function repairUploadsNowCore(conn: Client, body: DeployBody, log: (m: str
   await exec(conn, `cd ${supaDir} && (docker compose restart storage rest kong 2>&1 || docker-compose restart storage rest kong 2>&1 || true)`);
   await ensureLocalApiServices(conn, supaDir, kongPort, anonKey, log);
 
+  // Cause n°1 des HTTP 502 sur /storage/v1 : le conteneur storage est mort (upstream refusé par Kong).
+  const storageService = await recoverStorageContainer(conn, supaDir, kongPort, anonKey, log);
+  await ensureWebContainerRunning(conn, `${remoteDir}/repo`, log);
+
   await log("→ Tests d'upload directs sur le backend local…");
-  const storageTests = [
+  let storageTests = [
     await verifyStorageUploadAtBase(conn, supaDir, `http://127.0.0.1:${kongPort}`, anonKey, "uploads", "backend_direct"),
     await verifyStorageUploadAtBase(conn, supaDir, `http://127.0.0.1:${kongPort}`, anonKey, "media", "backend_direct"),
   ];
+  // Un 502/503 signifie que storage n'a pas fini de démarrer : on retente une fois après récupération.
+  if (storageTests.some((t) => /^(50\d|000)$/.test(t.status))) {
+    await recoverStorageContainer(conn, supaDir, kongPort, anonKey, log);
+    storageTests = [
+      await verifyStorageUploadAtBase(conn, supaDir, `http://127.0.0.1:${kongPort}`, anonKey, "uploads", "backend_direct"),
+      await verifyStorageUploadAtBase(conn, supaDir, `http://127.0.0.1:${kongPort}`, anonKey, "media", "backend_direct"),
+    ];
+  }
   for (const test of storageTests) {
     await log(`${test.ok ? "✓" : "✗"} Test ${test.label}/${test.bucket} → HTTP ${test.status}${test.detail ? ` (${test.detail})` : ""}`);
   }
@@ -2248,7 +2316,8 @@ async function repairUploadsNowCore(conn: Client, body: DeployBody, log: (m: str
   const proxy = await patchRunningWebProxyForUploads(conn, body, kongPort, anonKey, supaDir, log);
   const url = resolveBrowserAppBase(body, body.app_port || "8080");
   const ok = storageTests.every((test) => test.ok) && (proxy.ok || proxy.skipped);
-  const result = { action: "repair_uploads_now", ok, url, storage_tests: storageTests, proxy, supabase_local: { url, anon_key: anonKey } };
+  const result = { action: "repair_uploads_now", ok, url, storage_service: storageService, storage_tests: storageTests, proxy, supabase_local: { url, anon_key: anonKey } };
+
   await log(ok
     ? "✓ Uploads bibliothèque + QR corrigés. Rechargez l'application locale puis retestez."
     : "⚠ Réparation appliquée mais un test d'upload échoue encore — copiez le journal ci-dessus pour identifier le blocage exact.");

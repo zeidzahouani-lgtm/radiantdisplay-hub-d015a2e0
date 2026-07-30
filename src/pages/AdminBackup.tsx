@@ -1069,6 +1069,13 @@ To rebuild manually: docker compose up -d --build
   const [serverDiag, setServerDiag] = useState<{ checks: DiagCheck[]; suggestions: string[] } | null>(null);
   type MigItem = { name: string; status: "applied" | "skipped" | "error"; error?: string };
   const [migrationResult, setMigrationResult] = useState<{ total: number; applied: number; skipped: number; errors: number; items: MigItem[] } | null>(null);
+  type UploadRepairResult = {
+    ok?: boolean;
+    url?: string;
+    storage_tests?: Array<{ label: string; bucket: string; ok: boolean; status: string; detail?: string }>;
+    proxy?: { ok?: boolean; patched?: boolean; skipped?: boolean; detail?: string; http_status?: string };
+  };
+  const [uploadRepairResult, setUploadRepairResult] = useState<UploadRepairResult | null>(null);
 
   const runSshAction = async (
     action: string,
@@ -1155,7 +1162,36 @@ To rebuild manually: docker compose up -d --build
     runSshAction("repair_storage_buckets", {}, {
       initialLog: "🪣 Réparation des buckets Storage…",
       successMessage: "Buckets réparés ✓",
+      onResult: (r) => setUploadRepairResult(r),
     });
+
+  const handleRepairUploadsNow = () => {
+    setUploadRepairResult(null);
+    runSshAction("repair_uploads_now", {}, {
+      initialLog: "🛠 Correction uploads bibliothèque + QR sans redéploiement complet…",
+      successMessage: "Uploads corrigés ✓",
+      onResult: (r) => {
+        if (r) setUploadRepairResult(r);
+        if (r?.url) {
+          setSshDeployedUrl(r.url);
+          const updates: Record<string, any> = { sshDeployedUrl: r.url };
+          if (r.supabase_local) {
+            setSshLocalSupabaseInfo(r.supabase_local);
+            updates.sshLocalSupabaseInfo = r.supabase_local;
+            if (r.supabase_local.url) {
+              setSshSupabaseUrl(r.supabase_local.url);
+              updates.sshSupabaseUrl = r.supabase_local.url;
+            }
+            if (r.supabase_local.anon_key) {
+              setSshSupabaseKey(r.supabase_local.anon_key);
+              updates.sshSupabaseKey = r.supabase_local.anon_key;
+            }
+          }
+          persistSshConfig(updates);
+        }
+      },
+    });
+  };
 
   const handleRepairRealtime = () =>
     runSshAction("repair_realtime", {}, {
@@ -1349,6 +1385,7 @@ To rebuild manually: docker compose up -d --build
     quick_update: { label: "Mise à jour rapide", run: handleQuickUpdate },
     restart_stack: { label: "Redémarrer la stack", run: handleRestartStack },
     repair_web_container: { label: "Réparer le conteneur web", run: handleRepairWebContainer },
+    repair_uploads_now: { label: "Corriger uploads sans redéploiement", run: handleRepairUploadsNow },
     repair_local_writes: { label: "Réparer upload/écrans", run: handleRepairLocalWrites },
     repair_local_api_url: { label: "Corriger l'URL API", run: handleRepairApiUrl },
     repair_storage_buckets: { label: "Réparer buckets Storage", run: handleRepairBuckets },
@@ -2122,6 +2159,16 @@ To rebuild manually: docker compose up -d --build
                 </Button>
                 <Button
                   type="button"
+                  variant="default"
+                  className="gap-2"
+                  onClick={handleRepairUploadsNow}
+                  disabled={sshDeploying || !sshHost || !sshUser || !sshPassword}
+                  title="Répare les uploads bibliothèque et QR sans refaire un déploiement complet : buckets, permissions, restrictions MIME, Storage/Kong et proxy /storage/v1."
+                >
+                  <Upload className="h-4 w-4" />Corriger uploads sans redéploiement
+                </Button>
+                <Button
+                  type="button"
                   variant="secondary"
                   className="gap-2"
                   onClick={handleRepairLocalWrites}
@@ -2286,6 +2333,45 @@ To rebuild manually: docker compose up -d --build
                       </AlertDescription>
                     </Alert>
                   )}
+                </div>
+              )}
+
+              {uploadRepairResult && (
+                <div className="space-y-3 rounded-xl border bg-card/50 p-4">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <h3 className="text-sm font-semibold flex items-center gap-2">
+                      <Upload className="h-4 w-4" />Résumé réparation uploads
+                    </h3>
+                    <Badge variant={uploadRepairResult.ok ? "secondary" : "destructive"}>
+                      {uploadRepairResult.ok ? "OK" : "À vérifier"}
+                    </Badge>
+                  </div>
+                  <div className="grid sm:grid-cols-3 gap-2 text-xs">
+                    {(uploadRepairResult.storage_tests || []).map((test) => (
+                      <div key={`${test.label}-${test.bucket}`} className="p-2 rounded-lg bg-background border">
+                        <div className="font-medium flex items-center gap-1">
+                          {test.ok ? <CheckCircle2 className="h-3.5 w-3.5 text-primary" /> : <XCircle className="h-3.5 w-3.5 text-destructive" />}
+                          {test.label} / {test.bucket}
+                        </div>
+                        <div className="text-muted-foreground mt-1 truncate">
+                          HTTP {test.status || "n/a"}{test.detail ? ` · ${test.detail}` : ""}
+                        </div>
+                      </div>
+                    ))}
+                    {uploadRepairResult.proxy && (
+                      <div className="p-2 rounded-lg bg-background border">
+                        <div className="font-medium flex items-center gap-1">
+                          {uploadRepairResult.proxy.ok || uploadRepairResult.proxy.skipped
+                            ? <CheckCircle2 className="h-3.5 w-3.5 text-primary" />
+                            : <XCircle className="h-3.5 w-3.5 text-destructive" />}
+                          Proxy web /storage/v1
+                        </div>
+                        <div className="text-muted-foreground mt-1 truncate">
+                          {uploadRepairResult.proxy.skipped ? "Conteneur web non détecté" : `HTTP ${uploadRepairResult.proxy.http_status || "n/a"}`} {uploadRepairResult.proxy.detail || ""}
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
 

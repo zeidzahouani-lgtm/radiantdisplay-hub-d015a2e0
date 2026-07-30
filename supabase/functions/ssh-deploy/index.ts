@@ -14,7 +14,7 @@ const corsHeaders = {
 
 interface DeployBody {
   // Action: "deploy" (default), "reset_admin_password", or "check_admin_status" (read-only diagnostic)
-  action?: "deploy" | "reset_admin_password" | "check_admin_status" | "repair_local_writes" | "repair_local_api_url" | "diagnose_server" | "restart_stack" | "repair_storage_buckets" | "repair_realtime" | "apply_local_migrations" | "quick_update" | "build_status" | "network_inspect" | "network_recreate" | "network_set_subnet" | "network_set_hostname" | "network_get_config" | "network_set_container_ip";
+  action?: "deploy" | "reset_admin_password" | "check_admin_status" | "repair_local_writes" | "repair_local_api_url" | "repair_uploads_now" | "diagnose_server" | "restart_stack" | "repair_web_container" | "repair_storage_buckets" | "repair_realtime" | "apply_local_migrations" | "quick_update" | "build_status" | "network_inspect" | "network_recreate" | "network_set_subnet" | "network_set_hostname" | "network_get_config" | "network_set_container_ip";
   // Custom Docker network subnet (CIDR), e.g. 172.28.0.0/16
   network_subnet?: string;
   network_gateway?: string;
@@ -691,6 +691,7 @@ async function applyLocalDashboardWriteHotfix(conn: Client, supaDir: string, log
 GRANT USAGE ON SCHEMA public TO anon, authenticated;
 GRANT USAGE ON SCHEMA storage TO anon, authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO anon, authenticated;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO anon, authenticated;
 GRANT SELECT ON storage.buckets TO anon, authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON storage.objects TO anon, authenticated;
 
@@ -720,6 +721,16 @@ INSERT INTO storage.buckets (id, name, public, file_size_limit)
 VALUES ('uploads', 'uploads', true, 1073741824)
 ON CONFLICT (id) DO UPDATE SET public = true, file_size_limit = 1073741824;
 
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'storage' AND table_name = 'buckets' AND column_name = 'allowed_mime_types'
+  ) THEN
+    EXECUTE 'UPDATE storage.buckets SET allowed_mime_types = NULL WHERE id IN (''media'', ''uploads'')';
+  END IF;
+END $$;
+
 DROP POLICY IF EXISTS "Local dashboard can manage screens" ON public.screens;
 CREATE POLICY "Local dashboard can manage screens" ON public.screens
 FOR ALL TO anon, authenticated
@@ -731,6 +742,18 @@ CREATE POLICY "Local dashboard can manage media" ON public.media
 FOR ALL TO anon, authenticated
 USING (true)
 WITH CHECK (true);
+
+DO $$
+BEGIN
+  IF to_regclass('public.contents') IS NOT NULL THEN
+    EXECUTE 'DROP POLICY IF EXISTS "Local dashboard can manage QR contents" ON public.contents';
+    EXECUTE 'CREATE POLICY "Local dashboard can manage QR contents" ON public.contents FOR ALL TO anon, authenticated USING (true) WITH CHECK (true)';
+  END IF;
+  IF to_regclass('public.access_codes') IS NOT NULL THEN
+    EXECUTE 'DROP POLICY IF EXISTS "Local QR can read active access codes" ON public.access_codes';
+    EXECUTE 'CREATE POLICY "Local QR can read active access codes" ON public.access_codes FOR SELECT TO anon, authenticated USING (is_active = true OR auth.role() = ''authenticated'')';
+  END IF;
+END $$;
 
 DROP POLICY IF EXISTS "Users can insert establishment screens" ON public.screens;
 CREATE POLICY "Users can insert establishment screens" ON public.screens
@@ -1194,6 +1217,8 @@ async function runDeploymentJob(
       await runResetAdminPassword(body, log);
     } else if (body.action === "check_admin_status") {
       await runCheckAdminStatus(body, log, persist);
+    } else if (body.action === "repair_uploads_now") {
+      directResult = await runRepairUploadsNow(body, log);
     } else if (body.action === "repair_local_writes") {
       await runRepairLocalWrites(body, log);
     } else if (body.action === "repair_local_api_url") {
@@ -1300,7 +1325,9 @@ Deno.serve(async (req) => {
         ? "Réinitialisation du mot de passe admin lancée en arrière-plan."
         : action === "check_admin_status"
           ? "Vérification du compte admin lancée en arrière-plan."
-          : action === "repair_local_writes"
+            : action === "repair_uploads_now"
+              ? "Correction uploads bibliothèque/QR lancée en arrière-plan."
+              : action === "repair_local_writes"
             ? "Réparation upload/écrans lancée en arrière-plan."
             : action === "repair_local_api_url"
               ? "Réparation de l'URL API locale lancée en arrière-plan."
@@ -2082,6 +2109,146 @@ PY`;
   (globalThis as any).__lastDeployResult = { action: "repair_local_api_url", ok: true, url: publicBase, supabase_local: { url: publicBase, anon_key: anonKey } };
 }
 
+function buildUploadRepairNginxConf(kongPort: string) {
+  return `client_max_body_size 1024m;
+server {
+  listen 80;
+  server_name _;
+  client_max_body_size 1024m;
+  root /usr/share/nginx/html;
+  index index.html;
+  proxy_connect_timeout 10s;
+  proxy_send_timeout 3600s;
+  proxy_read_timeout 3600s;
+  set $cors_origin $http_origin;
+  error_page 418 = @cors_preflight;
+  location @cors_preflight {
+    add_header Access-Control-Allow-Origin $cors_origin always;
+    add_header Vary Origin always;
+    add_header Access-Control-Allow-Methods "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS" always;
+    add_header Access-Control-Allow-Headers "authorization, apikey, content-type, x-client-info, x-upsert, prefer, accept-profile, content-profile, range, x-requested-with, x-supabase-api-version, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version" always;
+    add_header Access-Control-Max-Age 86400 always;
+    add_header Content-Length 0 always;
+    return 204;
+  }
+  location /auth/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/auth/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert; proxy_set_header Content-Type $http_content_type; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
+  location /rest/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/rest/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert; proxy_set_header Content-Type $http_content_type; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; client_max_body_size 50m; }
+  location /storage/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/storage/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert; proxy_set_header Content-Type $http_content_type; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; client_max_body_size 1024m; proxy_request_buffering off; proxy_buffering off; proxy_read_timeout 3600s; proxy_send_timeout 3600s; }
+  location /functions/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/functions/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
+  location /realtime/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/realtime/v1/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_read_timeout 3600s; proxy_send_timeout 3600s; }
+  location /assets/ { expires 1y; add_header Cache-Control "public, immutable"; }
+  location / { try_files $uri $uri/ /index.html; }
+}
+`;
+}
+
+async function verifyStorageUploadAtBase(conn: Client, supaDir: string, baseUrl: string, anonKey: string, bucket: "uploads" | "media", label: string) {
+  const testPath = `.screenflow-health/${crypto.randomUUID()}.txt`;
+  const url = `${baseUrl.replace(/\/$/, "")}/storage/v1/object/${bucket}/${testPath}`;
+  const result = await exec(
+    conn,
+    `body=/tmp/sf_upload_${bucket}_${label.replace(/[^a-z0-9]/gi, "_")}.txt; ` +
+      `code=$(printf 'screenflow-upload-test' | curl -sS -m 25 -o "$body" -w "%{http_code}" -X POST ${shQuote(url)} ` +
+      `-H ${shQuote(`apikey: ${anonKey}`)} -H ${shQuote(`Authorization: Bearer ${anonKey}`)} -H 'Content-Type: text/plain' -H 'x-upsert: true' --data-binary @- 2>/dev/null || true); ` +
+      `printf '%s\n' "$code"; head -c 500 "$body" 2>/dev/null || true`,
+  );
+  const [statusLine, ...bodyLines] = (result.stdout || "").split("\n");
+  const status = (statusLine || "000").trim() || "000";
+  const detail = bodyLines.join("\n").trim().replace(/\s+/g, " ").slice(0, 240);
+  await exec(conn, dockerPsql(supaDir, btoa(`delete from storage.objects where bucket_id = '${bucket}' and name = '${testPath.replace(/'/g, "''")}';`), false));
+  return { label, bucket, ok: /^2\d\d$/.test(status), status, detail };
+}
+
+async function patchRunningWebProxyForUploads(conn: Client, body: DeployBody, kongPort: string, anonKey: string, supaDir: string, log: (m: string) => Promise<void> | void) {
+  const remoteDir = body.remote_dir || "/opt/screenflow";
+  const repoDir = `${remoteDir}/repo`;
+  const appPort = body.app_port || "8080";
+  const nginxConf = buildUploadRepairNginxConf(kongPort);
+  const tmpConf = `/tmp/screenflow-upload-fix-${crypto.randomUUID()}.conf`;
+  const result: any = { patched: false, ok: false, skipped: false, detail: "" };
+
+  await uploadFile(conn, tmpConf, Buffer.from(nginxConf));
+  await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(nginxConf)).catch(() => undefined);
+
+  const cidOut = await exec(conn, `CID=""; if [ -f ${repoDir}/docker-compose.yml ]; then CID=$(cd ${repoDir} && (docker compose ps -q web || docker-compose ps -q web) 2>/dev/null | head -1); fi; if [ -z "$CID" ]; then CID=$(docker ps --format '{{.ID}} {{.Names}}' | awk 'tolower($0) ~ /screenflow/ && tolower($0) ~ /web/ {print $1; exit}'); fi; echo "$CID"`);
+  const cid = cidOut.stdout.trim().split(/\s+/)[0] || "";
+  if (!cid) {
+    result.skipped = true;
+    result.detail = "Aucun conteneur web actif détecté";
+    await log("⚠ Proxy web non rechargé : aucun conteneur web actif détecté.");
+    return result;
+  }
+
+  await log("→ Rechargement du proxy /storage/v1 dans le conteneur web sans rebuild…");
+  const reload = await exec(conn, `docker cp ${tmpConf} ${cid}:/etc/nginx/conf.d/default.conf && docker exec ${cid} nginx -t && docker exec ${cid} nginx -s reload 2>&1`);
+  const reloadOutput = `${reload.stdout}${reload.stderr}`;
+  if (reload.code !== 0 || /emerg|failed|error/i.test(reloadOutput)) {
+    result.detail = reloadOutput.slice(-500);
+    await log("✗ Reload nginx échoué: " + result.detail);
+    return result;
+  }
+  result.patched = true;
+  await log("✓ Proxy web rechargé sans reconstruire l'application");
+  const proxyTest = await verifyStorageUploadAtBase(conn, supaDir, `http://127.0.0.1:${appPort}`, anonKey, "uploads", "proxy_web");
+  result.ok = proxyTest.ok;
+  result.http_status = proxyTest.status;
+  result.detail = proxyTest.detail || (proxyTest.ok ? "Upload test OK via le proxy web" : "Upload test KO via le proxy web");
+  await log(`${proxyTest.ok ? "✓" : "✗"} Test upload via proxy web /storage/v1 → HTTP ${proxyTest.status}${proxyTest.detail ? ` (${proxyTest.detail})` : ""}`);
+  return result;
+}
+
+async function repairUploadsNowCore(conn: Client, body: DeployBody, log: (m: string) => Promise<void> | void) {
+  const remoteDir = body.remote_dir || "/opt/screenflow";
+  const supaDir = `${remoteDir}/supabase`;
+  const supaPresent = (await exec(conn, `[ -f ${supaDir}/docker-compose.yml ] && echo OK || echo NO`)).stdout.includes("OK");
+  if (!supaPresent) throw new Error(`Aucune stack backend locale trouvée dans ${supaDir}`);
+
+  await ensurePostgresSqlAccess(conn, supaDir, log);
+  const kongPort = await readRemoteEnv(conn, `${supaDir}/.env`, "KONG_HTTP_PORT") || body.supabase_kong_http_port || "8000";
+  const anonKey = await readRemoteEnv(conn, `${supaDir}/.env`, "ANON_KEY") || await readRemoteEnv(conn, `${supaDir}/.env`, "SUPABASE_PUBLISHABLE_KEY");
+  if (!anonKey) throw new Error(`Impossible de lire ANON_KEY dans ${supaDir}/.env`);
+
+  await log("→ Démarrage/vérification des services Storage, REST et gateway…");
+  const up = await exec(conn, `cd ${supaDir} && (docker compose up -d db kong rest storage auth 2>&1 || docker-compose up -d db kong rest storage auth 2>&1 || true)`);
+  if (up.stdout.trim() || up.stderr.trim()) await log(`${up.stdout}${up.stderr}`.slice(-1000));
+
+  await applyLocalDashboardWriteHotfix(conn, supaDir, log);
+  await exec(conn, `cd ${supaDir} && (docker compose restart storage rest kong 2>&1 || docker-compose restart storage rest kong 2>&1 || true)`);
+  await ensureLocalApiServices(conn, supaDir, kongPort, anonKey, log);
+
+  await log("→ Tests d'upload directs sur le backend local…");
+  const storageTests = [
+    await verifyStorageUploadAtBase(conn, supaDir, `http://127.0.0.1:${kongPort}`, anonKey, "uploads", "backend_direct"),
+    await verifyStorageUploadAtBase(conn, supaDir, `http://127.0.0.1:${kongPort}`, anonKey, "media", "backend_direct"),
+  ];
+  for (const test of storageTests) {
+    await log(`${test.ok ? "✓" : "✗"} Test ${test.label}/${test.bucket} → HTTP ${test.status}${test.detail ? ` (${test.detail})` : ""}`);
+  }
+
+  const proxy = await patchRunningWebProxyForUploads(conn, body, kongPort, anonKey, supaDir, log);
+  const url = resolveBrowserAppBase(body, body.app_port || "8080");
+  const ok = storageTests.every((test) => test.ok) && (proxy.ok || proxy.skipped);
+  const result = { action: "repair_uploads_now", ok, url, storage_tests: storageTests, proxy, supabase_local: { url, anon_key: anonKey } };
+  await log(ok
+    ? "✓ Uploads bibliothèque + QR corrigés. Rechargez l'application locale puis retestez."
+    : "⚠ Réparation appliquée mais un test d'upload échoue encore — copiez le journal ci-dessus pour identifier le blocage exact.");
+  return result;
+}
+
+async function runRepairUploadsNow(body: DeployBody, log: (m: string) => Promise<void> | void) {
+  const port = body.port ?? 22;
+  await log(`→ Connexion SSH ${body.username}@${body.host}:${port}…`);
+  const conn = await ssh({ host: body.host, port, username: body.username, password: body.password });
+  await log("✓ SSH connecté");
+  try {
+    const result = await repairUploadsNowCore(conn, body, log);
+    (globalThis as any).__lastDeployResult = result;
+    return result;
+  } finally {
+    try { conn.end(); } catch (_) {}
+  }
+}
+
 async function runRepairLocalApiUrl(body: DeployBody, log: (m: string) => Promise<void> | void) {
   const port = body.port ?? 22;
   const remoteDir = body.remote_dir || "/opt/screenflow";
@@ -2647,33 +2814,11 @@ async function runRepairStorageBuckets(body: DeployBody, log: (m: string) => Pro
   const conn = await ssh({ host: body.host, port, username: body.username, password: body.password });
   await log("✓ SSH connecté");
   try {
-    const supaPresent = (await exec(conn, `[ -f ${supaDir}/docker-compose.yml ] && echo OK || echo NO`)).stdout.includes("OK");
-    if (!supaPresent) throw new Error(`Aucune stack Supabase locale dans ${supaDir}`);
-    await ensurePostgresSqlAccess(conn, supaDir, log);
-
-    const sql = `
-      insert into storage.buckets (id, name, public, file_size_limit)
-      values ('uploads','uploads', true, 1073741824)
-      on conflict (id) do update set public=excluded.public, file_size_limit=excluded.file_size_limit;
-      insert into storage.buckets (id, name, public, file_size_limit)
-      values ('media','media', true, 1073741824)
-      on conflict (id) do update set public=excluded.public, file_size_limit=excluded.file_size_limit;
-      grant usage on schema storage to anon, authenticated;
-      grant select on storage.buckets to anon, authenticated;
-      grant select, insert, update, delete on storage.objects to anon, authenticated;
-      drop policy if exists public_read_uploads on storage.objects;
-      create policy public_read_uploads on storage.objects for select to anon, authenticated using (bucket_id in ('uploads','media'));
-      drop policy if exists auth_write_uploads on storage.objects;
-      create policy auth_write_uploads on storage.objects for insert to anon, authenticated with check (bucket_id in ('uploads','media'));
-      drop policy if exists auth_update_uploads on storage.objects;
-      create policy auth_update_uploads on storage.objects for update to anon, authenticated using (bucket_id in ('uploads','media')) with check (bucket_id in ('uploads','media'));
-      drop policy if exists auth_delete_uploads on storage.objects;
-      create policy auth_delete_uploads on storage.objects for delete to anon, authenticated using (bucket_id in ('uploads','media'));`;
-    const out = await exec(conn, dockerPsqlExec(supaDir, sql));
-    await log(out.stdout.split("\n").slice(-20).join("\n"));
-    await exec(conn, `cd ${supaDir} && (docker compose restart storage || docker-compose restart storage) 2>&1`);
-    await log("✓ Buckets 'uploads' et 'media' réparés");
-    (globalThis as any).__lastDeployResult = { action: "repair_storage_buckets", ok: true };
+    const result = await repairUploadsNowCore(conn, body, log);
+    const bucketResult = { ...result, action: "repair_storage_buckets" };
+    await log("✓ Buckets 'uploads' et 'media' réparés et testés");
+    (globalThis as any).__lastDeployResult = bucketResult;
+    return bucketResult;
   } finally {
     try { conn.end(); } catch (_) {}
   }

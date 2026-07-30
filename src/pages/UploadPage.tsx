@@ -1,7 +1,8 @@
 import { useState, useRef } from "react";
 import { useParams } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
-import { explainSupabaseError, getSupabasePublishableKey, supabaseEndpoint } from "@/lib/env";
+import { explainSupabaseError } from "@/lib/env";
+import { uploadMediaFile } from "@/lib/supabase-helpers";
 import { toast } from "sonner";
 import { Upload, Lock, CheckCircle, Loader2, Image as ImageIcon, Clock, CalendarDays, RotateCw, Video } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -101,36 +102,7 @@ export default function UploadPage() {
     setUploading(true);
     setUploadProgress(0);
     try {
-      const ext = file.name.split(".").pop() || (isVideo ? "mp4" : "jpg");
-      const filePath = `screen-${screenId}/${Date.now()}_${userName.replace(/\s+/g, "_")}.${ext}`;
-
-      const bucketUrl = supabaseEndpoint(`/storage/v1/object/uploads/${filePath}`);
-      const apiKey = getSupabasePublishableKey();
-
-      await new Promise<void>((resolve, reject) => {
-        const xhr = new XMLHttpRequest();
-        xhr.open("POST", bucketUrl, true);
-        xhr.setRequestHeader("apikey", apiKey);
-        xhr.setRequestHeader("Authorization", `Bearer ${apiKey}`);
-        xhr.setRequestHeader("x-upsert", "true");
-
-        xhr.upload.onprogress = (e) => {
-          if (e.lengthComputable) {
-            setUploadProgress(Math.round((e.loaded / e.total) * 100));
-          }
-        };
-
-        xhr.onload = () => {
-          if (xhr.status >= 200 && xhr.status < 300) resolve();
-          else reject(new Error(`Upload failed: ${xhr.status}`));
-        };
-        xhr.onerror = () => reject(new Error("Upload failed: network/CORS"));
-        xhr.send(file);
-      });
-
-      const { data: urlData } = supabase.storage.from("uploads").getPublicUrl(filePath);
-      const publicUrl = urlData?.publicUrl;
-      if (!publicUrl) throw new Error("URL introuvable");
+      const publicUrl = await uploadMediaFile(file, setUploadProgress, "uploads");
 
       const start = new Date(startTime);
       const end = new Date(endTime);

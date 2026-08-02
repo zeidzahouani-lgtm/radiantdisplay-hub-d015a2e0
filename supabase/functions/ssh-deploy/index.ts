@@ -1510,7 +1510,51 @@ END $$;
 }
 
 async function ensureDefaultAdminRole(conn: Client, supaDir: string, log: (m: string) => Promise<void> | void) {
+  // Bootstrap minimal du schéma de rôles : sur une base locale fraîche (migrations
+  // pas encore appliquées) public.user_roles peut être absent, ce qui faisait
+  // échouer l'attribution puis le contrôle des droits admin.
+  const bootstrapSql = `
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname='app_role') THEN
+    CREATE TYPE public.app_role AS ENUM ('admin','user','marketing');
+  END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS public.user_roles (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  role public.app_role NOT NULL,
+  UNIQUE (user_id, role)
+);
+GRANT SELECT ON public.user_roles TO authenticated;
+GRANT ALL ON public.user_roles TO service_role;
+ALTER TABLE public.user_roles ENABLE ROW LEVEL SECURITY;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='user_roles'
+      AND policyname='Users can view their own roles'
+  ) THEN
+    CREATE POLICY "Users can view their own roles" ON public.user_roles
+      FOR SELECT TO authenticated USING (user_id = auth.uid());
+  END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION public.has_role(_user_id uuid, _role public.app_role)
+RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $fn$
+  SELECT EXISTS (SELECT 1 FROM public.user_roles WHERE user_id = _user_id AND role = _role)
+$fn$;
+`.trim();
+  const bootstrap = await exec(conn, dockerPsql(supaDir, b64utf8(bootstrapSql)));
+  if (bootstrap.code !== 0) {
+    await log("⚠ Bootstrap du schéma de rôles partiel : " + (bootstrap.stdout + bootstrap.stderr).trim().slice(-400));
+  } else {
+    await log("✓ Schéma des rôles (public.user_roles) présent");
+  }
+
   const roleSql = `
+
 DO $$
 DECLARE
   uid uuid;
@@ -1593,11 +1637,26 @@ END $$;
     where lower(u.email) = lower('${DEFAULT_ADMIN_EMAIL}')
     limit 1
   `.trim();
-  const verify = await exec(conn, dockerPsqlSelect(supaDir, verifySql, false));
-  const verifyOutput = `${verify.stdout || ""}\n${verify.stderr || ""}`;
+  const verifySqlNoEstablishments = `
+    select 'SCREENFLOW_ADMIN_OK|' ||
+           coalesce((select string_agg(distinct ur.role::text, ',' order by ur.role::text)
+                     from public.user_roles ur where ur.user_id = u.id), 'AUCUN') || '|0'
+    from auth.users u
+    where lower(u.email) = lower('${DEFAULT_ADMIN_EMAIL}')
+    limit 1
+  `.trim();
+
+  let verify = await exec(conn, dockerPsqlSelect(supaDir, verifySql, false));
+  let verifyOutput = `${verify.stdout || ""}\n${verify.stderr || ""}`;
+  if (verify.code !== 0 && /user_establishments/.test(verifyOutput)) {
+    // Base locale sans table multi-tenant : on contrôle uniquement les rôles globaux.
+    verify = await exec(conn, dockerPsqlSelect(supaDir, verifySqlNoEstablishments, false));
+    verifyOutput = `${verify.stdout || ""}\n${verify.stderr || ""}`;
+  }
   if (verify.code !== 0) {
     throw new Error("Droits admin attribués, mais leur contrôle PostgreSQL a échoué : " + verifyOutput.trim().slice(-800));
   }
+
   const parsed = verifyOutput.split("\n").map((line) => line.trim())
     .find((line) => line.startsWith("SCREENFLOW_ADMIN_OK|")) || "";
   const [, roles = "", estCount = "0"] = parsed.split("|");

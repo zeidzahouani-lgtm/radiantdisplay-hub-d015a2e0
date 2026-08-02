@@ -222,11 +222,47 @@ repo = Path(${JSON.stringify(repoDir)})
 dockerfile = repo / 'Dockerfile'
 package_json = repo / 'package.json'
 
-if not dockerfile.is_file() or not package_json.is_file():
-    raise SystemExit('Dockerfile ou package.json absent du dépôt distant')
+if not package_json.is_file():
+    candidates = sorted(
+        (p for p in repo.glob('**/package.json')
+         if 'node_modules' not in p.parts and '.git' not in p.parts),
+        key=lambda p: len(p.parts),
+    )
+    locations = ', '.join(str(p.relative_to(repo)) for p in candidates[:10]) or 'aucun'
+    raise SystemExit(
+        f'package.json absent à la racine du dépôt distant ({repo}). '
+        f'package.json trouvés ailleurs: {locations}. Vérifiez que l’URL Git pointe vers le dépôt ScreenFlow.'
+    )
+
+# A remote branch may predate the self-hosting Dockerfile. Recreate the
+# canonical entrypoint instead of aborting an otherwise valid deployment.
+if not dockerfile.is_file():
+    dockerfile.write_text('''FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package.json package-lock.json* bun.lockb* bun.lock* ./
+RUN npm install --no-audit --no-fund --legacy-peer-deps
+COPY . .
+ARG VITE_SUPABASE_URL
+ARG VITE_SUPABASE_PUBLISHABLE_KEY
+ARG VITE_SUPABASE_PROJECT_ID=local
+ARG VITE_PUBLIC_APP_URL
+ARG VITE_APP_BASE_PATH=/
+ENV VITE_SUPABASE_URL=$VITE_SUPABASE_URL
+ENV VITE_SUPABASE_PUBLISHABLE_KEY=$VITE_SUPABASE_PUBLISHABLE_KEY
+ENV VITE_SUPABASE_PROJECT_ID=$VITE_SUPABASE_PROJECT_ID
+ENV VITE_PUBLIC_APP_URL=$VITE_PUBLIC_APP_URL
+ENV VITE_APP_BASE_PATH=$VITE_APP_BASE_PATH
+RUN npm run build -- --mode selfhosted
+FROM nginx:alpine
+COPY --from=builder /app/dist /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+''')
 
 s = dockerfile.read_text()
 s = s.replace('RUN npm run build:local', 'RUN npm run build -- --mode selfhosted')
+s = s.replace('RUN npm run build\n', 'RUN npm run build -- --mode selfhosted\n')
 dockerfile.write_text(s)
 
 data = json.loads(package_json.read_text())
@@ -238,7 +274,7 @@ PY`;
   if (result.code !== 0 || !(result.stdout || "").includes("OK")) {
     throw new Error("Impossible de fiabiliser la commande de build distante: " + (result.stderr || result.stdout).slice(-500));
   }
-  await log("✓ Commande de build distante normalisée (mode Vite selfhosted)");
+  await log("✓ Entrée de build distante vérifiée/créée (mode Vite selfhosted)");
 }
 
 async function pollDetachedCompose(

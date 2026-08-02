@@ -1646,11 +1646,17 @@ END $$;
     limit 1
   `.trim();
 
-  const verify = await exec(conn, dockerPsqlSelect(supaDir, verifySql, false));
-  const verifyOutput = `${verify.stdout || ""}\n${verify.stderr || ""}`;
+  let verify = await exec(conn, dockerPsqlSelect(supaDir, verifySql, false));
+  let verifyOutput = `${verify.stdout || ""}\n${verify.stderr || ""}`;
+  if (verify.code !== 0 && /user_establishments/.test(verifyOutput)) {
+    // Base locale sans table multi-tenant : on contrôle uniquement les rôles globaux.
+    verify = await exec(conn, dockerPsqlSelect(supaDir, verifySqlNoEstablishments, false));
+    verifyOutput = `${verify.stdout || ""}\n${verify.stderr || ""}`;
+  }
   if (verify.code !== 0) {
     throw new Error("Droits admin attribués, mais leur contrôle PostgreSQL a échoué : " + verifyOutput.trim().slice(-800));
   }
+
   const parsed = verifyOutput.split("\n").map((line) => line.trim())
     .find((line) => line.startsWith("SCREENFLOW_ADMIN_OK|")) || "";
   const [, roles = "", estCount = "0"] = parsed.split("|");

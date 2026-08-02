@@ -11,7 +11,7 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
-    "build:local": "vite build --mode local",
+    "build:local": "vite build --mode selfhosted",
     "preview:local": "vite preview --host 0.0.0.0",
     "diagnose:local": "node scripts/diagnose-local.mjs",
     "deploy:local": "bash scripts/local-deploy.sh"

@@ -816,6 +816,7 @@ async function startLocalSupabaseEssentials(conn: Client, supaDir: string, log: 
   const services = await exec(conn, `cd ${supaDir} && docker compose config --services 2>/dev/null || true`);
   const available = new Set((services.stdout || "").split(/\s+/).filter(Boolean));
   const essentialServices = ["db", "kong", "auth", "rest", "realtime", "storage", "meta", "imgproxy", "functions", "edge-runtime"].filter((name) => available.has(name)).join(" ");
+  const apiServices = ["kong", "auth", "rest", "realtime", "storage", "meta", "imgproxy", "functions", "edge-runtime"].filter((name) => available.has(name)).join(" ");
   const optionalServices = ["studio"].filter((name) => available.has(name)).join(" ");
 
   // S'assurer qu'analytics/vector ne tournent pas et ne bloquent rien
@@ -829,7 +830,24 @@ async function startLocalSupabaseEssentials(conn: Client, supaDir: string, log: 
     await log((`${pull.stdout}${pull.stderr}`).slice(-1800));
   }
 
-  const upEssential = await exec(conn, `cd ${supaDir} && docker compose up -d ${essentialServices} 2>&1`);
+  // Storage/Auth/REST run database migrations during first boot. Starting them while
+  // Postgres is merely "running" (but not ready) creates crash loops and leaves Kong
+  // forwarding to a Storage container where port 5000 is not listening yet.
+  if (available.has("db")) {
+    await log("→ Démarrage de PostgreSQL et attente de disponibilité avant les API…");
+    const upDb = await exec(conn, `cd ${supaDir} && docker compose up -d db 2>&1`);
+    if (upDb.code !== 0) {
+      throw new Error("Échec du démarrage PostgreSQL local : " + `${upDb.stdout}${upDb.stderr}`.slice(-900));
+    }
+    const dbReady = await exec(conn, `cd ${supaDir} && for i in $(seq 1 60); do docker compose exec -T db pg_isready -U postgres >/dev/null 2>&1 && echo DB_READY && exit 0; sleep 2; done; echo DB_TIMEOUT; exit 1`);
+    if (dbReady.code !== 0 || !/DB_READY/.test(dbReady.stdout || "")) {
+      const dbLogs = await exec(conn, `cd ${supaDir} && docker compose logs --tail=100 db 2>&1 || true`);
+      throw new Error("PostgreSQL local ne devient pas disponible : " + `${dbLogs.stdout}${dbLogs.stderr}`.slice(-1800));
+    }
+    await log("✓ PostgreSQL prêt — démarrage des services API");
+  }
+
+  const upEssential = await exec(conn, `cd ${supaDir} && docker compose up -d ${apiServices || essentialServices} 2>&1`);
   const essentialOutput = `${upEssential.stdout}${upEssential.stderr}`;
   await log(essentialOutput.slice(-2400));
 
@@ -893,7 +911,7 @@ async function ensureLocalApiServices(conn: Client, supaDir: string, kongPort: s
   probe = await exec(conn, buildProbeCmd(20, 3));
   output = `${probe.stdout}${probe.stderr}`;
   if (!(probe.code === 0 && /OK rest=/.test(output))) {
-    const ps = await exec(conn, `cd ${supaDir} && echo '--- CONTAINERS ---' && docker compose ps -a && echo '--- STORAGE ---' && docker compose logs --tail=120 storage 2>&1 && echo '--- REST/AUTH/KONG ---' && docker compose logs --tail=50 rest auth kong 2>&1 || true`);
+    const ps = await exec(conn, `cd ${supaDir} && echo '--- CONTAINERS ---' && docker compose ps -a && echo '--- STORAGE DIRECT ---' && CID=$(docker compose ps -q storage 2>/dev/null | head -1); if [ -n "$CID" ]; then docker inspect -f 'state={{.State.Status}} running={{.State.Running}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} ip={{range.NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$CID"; IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CID"); curl -sS -m 4 -w '\nHTTP=%{http_code}\n' "http://$IP:5000/status" 2>&1 || true; fi; echo '--- STORAGE LOGS ---' && docker compose logs --tail=120 storage 2>&1 && echo '--- REST/AUTH/KONG ---' && docker compose logs --tail=50 rest auth kong 2>&1 || true`);
     throw new Error(
       "La base locale, Auth ou Storage reste indisponible après redémarrage automatique. Détails: " +
       `${output}\nStorage recovery: ${JSON.stringify(storageRecovery)}\n${ps.stdout}${ps.stderr}`.slice(-5000)

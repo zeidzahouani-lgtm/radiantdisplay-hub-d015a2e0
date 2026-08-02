@@ -3359,6 +3359,19 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
       throw new Error(result.cause);
     }
 
+    // HTTP 200 only proves that Nginx returned index.html. Also inspect the
+    // generated browser bundle: passing our marker directly to createClient()
+    // throws synchronously and produces a completely blank page.
+    const bundleCheck = await exec(conn, `docker exec ${cid} sh -c 'if grep -R -q "const [A-Za-z0-9_$]*=\"__SCREENFLOW_SAME_ORIGIN__\".*createClient\|YTe(\"__SCREENFLOW_SAME_ORIGIN__\"" /usr/share/nginx/html/assets 2>/dev/null; then echo INVALID_MARKER; else echo OK; fi'`);
+    result.browser_bundle_ok = (bundleCheck.stdout || "").includes("OK");
+    await log(result.browser_bundle_ok
+      ? "✓ Bundle navigateur valide (URL backend HTTP absolue)"
+      : "✗ Bundle navigateur invalide : marqueur same-origin transmis directement au client backend");
+    if (!result.browser_bundle_ok) {
+      result.cause = "Le serveur répond HTTP 200 mais le JavaScript produit une page blanche : URL backend invalide dans le bundle. Relancez la réparation avec cette version.";
+      throw new Error(result.cause);
+    }
+
     // 4. Make sure storage service + policies/buckets are healthy (uploads)
     const supaPresent = (await exec(conn, `[ -f ${supaDir}/docker-compose.yml ] && echo OK || echo NO`)).stdout.includes("OK");
     if (supaPresent) {

@@ -185,6 +185,14 @@ async function prepareEarlyWebDeployment(
   log: (m: string) => Promise<void> | void,
 ) {
   const publicAppUrl = resolveBrowserAppBase(body, appPort, false);
+  // The Supabase client validates its URL synchronously. Older remote
+  // checkouts can bypass our Vite alias and pass the same-origin marker
+  // directly to createClient(), which leaves the page completely blank.
+  // Always provide a valid browser URL at build time; Nginx proxies the API
+  // paths on that same public application origin.
+  const browserSupabaseUrl = ["__SCREENFLOW_SAME_ORIGIN__", "same-origin", "runtime:same-origin"].includes(supabaseUrl)
+    ? publicAppUrl
+    : supabaseUrl;
   const quoteYaml = (value: string) => `'${(value || "").replace(/'/g, "''")}'`;
   const compose = `services:
   web:
@@ -192,7 +200,7 @@ async function prepareEarlyWebDeployment(
     build:
       context: .
       args:
-        VITE_SUPABASE_URL: ${quoteYaml(supabaseUrl)}
+        VITE_SUPABASE_URL: ${quoteYaml(browserSupabaseUrl)}
         VITE_SUPABASE_PUBLISHABLE_KEY: ${quoteYaml(supabaseKey)}
         VITE_SUPABASE_PROJECT_ID: ${quoteYaml(projectId)}
         VITE_PUBLIC_APP_URL: ${quoteYaml(publicAppUrl)}
@@ -2232,7 +2240,7 @@ ${localFunctionLocations}
     build:
       context: .
       args:
-        VITE_SUPABASE_URL: '${escEnv(installSupabase ? "__SCREENFLOW_SAME_ORIGIN__" : (supabaseUrlOverride || body.vite_supabase_url || ""))}'
+        VITE_SUPABASE_URL: '${escEnv(installSupabase ? publicAppUrl : (supabaseUrlOverride || body.vite_supabase_url || ""))}'
         VITE_SUPABASE_PUBLISHABLE_KEY: '${escEnv(supabaseAnonOverride || body.vite_supabase_key || "")}'
         VITE_SUPABASE_PROJECT_ID: '${escEnv(supabaseProjectIdOverride || body.vite_supabase_project_id || "")}'
         VITE_PUBLIC_APP_URL: '${escEnv(publicAppUrl)}'
@@ -3231,7 +3239,7 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
     build:
       context: .
       args:
-        VITE_SUPABASE_URL: '__SCREENFLOW_SAME_ORIGIN__'
+        VITE_SUPABASE_URL: ${quoteYaml(publicBase)}
         VITE_SUPABASE_PUBLISHABLE_KEY: ${quoteYaml(anonKey)}
         VITE_SUPABASE_PROJECT_ID: ${quoteYaml(projectId)}
         VITE_PUBLIC_APP_URL: ${quoteYaml(publicBase)}

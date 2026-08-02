@@ -1698,7 +1698,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
           `git remote set-url origin '${gitUrl}' 2>&1 && ` +
           `git fetch --depth 1 origin ${branch} 2>&1 && ` +
           `git reset --hard origin/${branch} 2>&1 && ` +
-          `git clean -fd 2>&1`,
+          `git clean -fd -e docker-compose.yml -e ssl 2>&1`,
         );
         log(pull.stdout.slice(-1500));
         if (pull.code !== 0) {
@@ -3283,6 +3283,10 @@ async function runQuickUpdate(body: DeployBody, log: (m: string) => Promise<void
     if (!repoPresent) {
       throw new Error(`Aucun dépôt cloné dans ${repoDir}. Lancez d'abord un déploiement complet.`);
     }
+    const appComposePresent = (await exec(conn, `[ -f ${repoDir}/docker-compose.yml ] && echo OK || echo NO`)).stdout.includes("OK");
+    if (!appComposePresent) {
+      throw new Error(`Manifest web absent dans ${repoDir}. Utilisez « Installer / mettre à jour automatiquement » : il recréera le manifeste et reprendra l'installation.`);
+    }
     const supaPresent = (await exec(conn, `[ -f ${supaDir}/docker-compose.yml ] && echo OK || echo NO`)).stdout.includes("OK");
 
     // ===== 1. Git pull =====
@@ -3290,7 +3294,7 @@ async function runQuickUpdate(body: DeployBody, log: (m: string) => Promise<void
     const beforeSha = (await exec(conn, `cd ${repoDir} && git rev-parse HEAD 2>/dev/null || echo none`)).stdout.trim();
     const pull = await exec(
       conn,
-      `cd ${repoDir} && git fetch --depth 1 origin ${branch} 2>&1 && git reset --hard origin/${branch} 2>&1 && git clean -fd 2>&1`,
+      `cd ${repoDir} && git fetch --depth 1 origin ${branch} 2>&1 && git reset --hard origin/${branch} 2>&1 && git clean -fd -e docker-compose.yml -e ssl 2>&1`,
     );
     if (pull.code !== 0) {
       throw new Error(`git pull a échoué : ${pull.stdout.slice(-400)}`);

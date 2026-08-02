@@ -199,7 +199,7 @@ export default function AdminBackup() {
   const [sshSupabaseKey, setSshSupabaseKey] = useState("");
   const [sshSupabaseProjectId, setSshSupabaseProjectId] = useState("");
   // Install local self-hosted Supabase on the same server
-  const [sshInstallSupabaseLocal, setSshInstallSupabaseLocal] = useState(false);
+  const [sshInstallSupabaseLocal, setSshInstallSupabaseLocal] = useState(true);
   const [sshForceFreshInstall, setSshForceFreshInstall] = useState(false);
   const [sshDbStack, setSshDbStack] = useState<"supabase_full" | "postgres_only">("supabase_full");
   const [sshPostgresImage, setSshPostgresImage] = useState("postgres:15");
@@ -2127,7 +2127,7 @@ To rebuild manually: docker compose up -d --build
                 >
                   {sshDeploying
                     ? <><Loader2 className="h-4 w-4 animate-spin" />Déploiement en cours…</>
-                    : <><Rocket className="h-4 w-4" />Déployer maintenant</>}
+                    : <><Rocket className="h-4 w-4" />Installer / mettre à jour automatiquement</>}
                 </Button>
                 <Button
                   type="button"

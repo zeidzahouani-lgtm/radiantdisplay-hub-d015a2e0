@@ -166,6 +166,52 @@ async function startDetachedCompose(conn: Client, repoDir: string, stateDir: str
   }
 }
 
+/**
+ * Create a usable web compose file as soon as the repository is available.
+ * The local backend can take several minutes to start; keeping this scaffold
+ * early makes the deployment resumable and prevents repair actions from
+ * finding a cloned repository without docker-compose.yml.
+ */
+async function prepareEarlyWebDeployment(
+  conn: Client,
+  body: DeployBody,
+  repoDir: string,
+  remoteDir: string,
+  appPort: string,
+  supabaseUrl: string,
+  supabaseKey: string,
+  projectId: string,
+  log: (m: string) => Promise<void> | void,
+) {
+  const publicAppUrl = resolveBrowserAppBase(body, appPort, false);
+  const quoteYaml = (value: string) => `'${(value || "").replace(/'/g, "''")}'`;
+  const compose = `services:
+  web:
+    build:
+      context: .
+      args:
+        VITE_SUPABASE_URL: ${quoteYaml(supabaseUrl)}
+        VITE_SUPABASE_PUBLISHABLE_KEY: ${quoteYaml(supabaseKey)}
+        VITE_SUPABASE_PROJECT_ID: ${quoteYaml(projectId)}
+        VITE_PUBLIC_APP_URL: ${quoteYaml(publicAppUrl)}
+        VITE_APP_BASE_PATH: '/'
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${appPort}:80"
+    restart: unless-stopped
+`;
+  await uploadFile(conn, `${repoDir}/docker-compose.yml`, Buffer.from(compose));
+  await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
+  const required = await exec(conn, `[ -f ${repoDir}/Dockerfile ] && [ -f ${repoDir}/nginx.conf ] && echo OK || echo NO`);
+  if (!(required.stdout || "").includes("OK")) {
+    throw new Error(`Le dépôt ${repoDir} doit contenir Dockerfile et nginx.conf.`);
+  }
+  await log("✓ Déploiement web préparé tôt (reprise automatique possible)");
+  await startDetachedCompose(conn, repoDir, `${remoteDir}/.build`);
+  await log("✓ Build web lancé en arrière-plan pendant la préparation du backend");
+}
+
 async function pollDetachedCompose(
   conn: Client,
   stateDir: string,
@@ -1675,6 +1721,22 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
         log("✓ Repo cloned");
       }
 
+      // For an external/shared backend all build credentials are already known,
+      // so start the web build before any optional local infrastructure work.
+      if (!installSupabase && !installPostgresOnly) {
+        await prepareEarlyWebDeployment(
+          conn,
+          body,
+          `${remoteDir}/repo`,
+          remoteDir,
+          appPort,
+          body.vite_supabase_url || "",
+          body.vite_supabase_key || "",
+          body.vite_supabase_project_id || "",
+          log,
+        );
+      }
+
       await ensureDeploymentBudget("installation/contrôle Supabase local");
 
 
@@ -1730,6 +1792,20 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
         ].join("\n") + "\n" + buildLocalAuthUrlEnvPatch(body, appPort, supaBrowserUrl, enableHttps, httpsDomain, httpsPort);
         const envB64 = btoa(envPatch);
         await exec(conn, `cd ${supaDir} && for k in POSTGRES_PASSWORD JWT_SECRET ANON_KEY SERVICE_ROLE_KEY SUPABASE_PUBLISHABLE_KEY SUPABASE_SECRET_KEY DASHBOARD_USERNAME DASHBOARD_PASSWORD SITE_URL API_EXTERNAL_URL GOTRUE_EXTERNAL_URL ADDITIONAL_REDIRECT_URLS SUPABASE_PUBLIC_URL KONG_HTTP_PORT KONG_HTTPS_PORT STUDIO_PORT POSTGRES_PORT ENABLE_EMAIL_SIGNUP ENABLE_EMAIL_AUTOCONFIRM ENABLE_ANONYMOUS_USERS DISABLE_SIGNUP; do sed -i "/^$k=/d" .env; done && echo "${envB64}" | base64 -d >> .env && serviceKey="${serviceKey}" && echo "_OK"`);
+
+        // Start the frontend now, in parallel with the lengthy backend image pulls.
+        // This also guarantees docker-compose.yml exists if the edge runtime stops.
+        await prepareEarlyWebDeployment(
+          conn,
+          body,
+          `${remoteDir}/repo`,
+          remoteDir,
+          appPort,
+          supaBrowserUrl,
+          anonKey,
+          "local",
+          log,
+        );
 
         log(`→ Starting Supabase containers essentiels (kong:${supaKongPort}, studio:${supaStudioPort}, db:${supaDbPort})…`);
         await syncLocalAuthSafeEnv(conn, supaDir, log);
@@ -1842,6 +1918,17 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
         supabaseAnonOverride = anonKey;
         supabaseProjectIdOverride = "local";
         await log("✓ Supabase local opérationnel (clés réutilisées depuis .env)");
+        await prepareEarlyWebDeployment(
+          conn,
+          body,
+          `${remoteDir}/repo`,
+          remoteDir,
+          appPort,
+          supaBrowserUrl,
+          anonKey,
+          "local",
+          log,
+        );
         (globalThis as any).__pendingLocalMigrations = { supaDir, postgresPw };
       }
 

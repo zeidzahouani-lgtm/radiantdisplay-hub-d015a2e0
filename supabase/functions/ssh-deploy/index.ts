@@ -1589,6 +1589,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
   let supabaseUrlOverride = "";
   let supabaseAnonOverride = "";
   let supabaseProjectIdOverride = "";
+  let earlyWebStarted = false;
   // L'edge function est coupée par le runtime après ~400s : on sort proprement avant.
   const deploymentDeadline = Date.now() + 8 * 60 * 1000;
   const ensureDeploymentBudget = async (nextStep: string) => {
@@ -1735,6 +1736,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
           body.vite_supabase_project_id || "",
           log,
         );
+        earlyWebStarted = true;
       }
 
       await ensureDeploymentBudget("installation/contrôle Supabase local");
@@ -1806,6 +1808,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
           "local",
           log,
         );
+        earlyWebStarted = true;
 
         log(`→ Starting Supabase containers essentiels (kong:${supaKongPort}, studio:${supaStudioPort}, db:${supaDbPort})…`);
         await syncLocalAuthSafeEnv(conn, supaDir, log);
@@ -1929,6 +1932,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
           "local",
           log,
         );
+        earlyWebStarted = true;
         (globalThis as any).__pendingLocalMigrations = { supaDir, postgresPw };
       }
 
@@ -2136,10 +2140,14 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
         log("✓ Certificat SSL généré");
       }
 
-      await log("→ Build des conteneurs lancé en arrière-plan sur le serveur (docker compose up -d --build)…");
+      await log(earlyWebStarted
+        ? "→ Finalisation du build web déjà lancé en arrière-plan…"
+        : "→ Build des conteneurs lancé en arrière-plan sur le serveur (docker compose up -d --build)…");
       const buildStateDir = `${remoteDir}/.build`;
-      await startDetachedCompose(conn, `${remoteDir}/repo`, buildStateDir);
-      await log("✓ Build détaché démarré — il continue même si cette session se termine.");
+      if (!earlyWebStarted) {
+        await startDetachedCompose(conn, `${remoteDir}/repo`, buildStateDir);
+        await log("✓ Build détaché démarré — il continue même si cette session se termine.");
+      }
       const buildDeadline = Math.min(deploymentDeadline, Date.now() + 4 * 60 * 1000);
       const buildResult = await pollDetachedCompose(conn, buildStateDir, buildDeadline, log);
       if (!buildResult.done) {

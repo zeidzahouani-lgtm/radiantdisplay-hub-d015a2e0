@@ -927,17 +927,22 @@ async function startLocalSupabaseEssentials(conn: Client, supaDir: string, log: 
 
 async function ensureLocalApiServices(conn: Client, supaDir: string, kongPort: string, anonKey: string, log: (m: string) => Promise<void> | void) {
   await log("→ Vérification Auth/REST/Storage derrière la gateway locale…");
+  // A service is considered healthy as soon as it answers ANY HTTP status below 500
+  // through Kong. Using a table-specific REST path used to fail with 404 on a fresh
+  // database (schema not migrated yet) even though PostgREST was perfectly healthy.
   const buildProbeCmd = (attempts: number, delaySeconds: number) =>
     `ANON=${shQuote(anonKey)} sh -c ` +
     shQuote(
+      `alive() { case "$1" in ""|000|5*) return 1;; *) return 0;; esac; }; ` +
       `for i in $(seq 1 ${attempts}); do ` +
-      `rest=$(curl -sS -m 4 -o /tmp/sf_rest.txt -w "%{http_code}" "http://127.0.0.1:${kongPort}/rest/v1/establishments?select=id&limit=1" -H "apikey: $ANON" -H "Authorization: Bearer $ANON" 2>/dev/null || true); ` +
+      `rest=$(curl -sS -m 4 -o /tmp/sf_rest.txt -w "%{http_code}" "http://127.0.0.1:${kongPort}/rest/v1/" -H "apikey: $ANON" -H "Authorization: Bearer $ANON" 2>/dev/null || true); ` +
       `stor=$(curl -sS -m 4 -o /tmp/sf_storage.txt -w "%{http_code}" "http://127.0.0.1:${kongPort}/storage/v1/bucket" -H "apikey: $ANON" -H "Authorization: Bearer $ANON" 2>/dev/null || true); ` +
       `auth=$(curl -sS -m 4 -o /tmp/sf_auth.txt -w "%{http_code}" "http://127.0.0.1:${kongPort}/auth/v1/health" -H "apikey: $ANON" 2>/dev/null || true); ` +
-      `case "$rest:$stor:$auth" in 2*:2*:2*|2*:401:2*|2*:403:2*|401:2*:2*|403:2*:2*|401:401:2*|401:403:2*|403:401:2*|403:403:2*) echo "OK rest=$rest storage=$stor auth=$auth"; exit 0;; esac; ` +
+      `if alive "$rest" && alive "$stor" && alive "$auth"; then echo "OK rest=$rest storage=$stor auth=$auth"; exit 0; fi; ` +
       `echo "WAIT $i/${attempts} rest=$rest storage=$stor auth=$auth"; sleep ${delaySeconds}; done; ` +
-      `echo FAIL; echo REST_BODY; cat /tmp/sf_rest.txt 2>/dev/null || true; echo STORAGE_BODY; cat /tmp/sf_storage.txt 2>/dev/null || true`
+      `echo "FAIL rest=$rest storage=$stor auth=$auth"; echo REST_BODY; cat /tmp/sf_rest.txt 2>/dev/null || true; echo STORAGE_BODY; cat /tmp/sf_storage.txt 2>/dev/null || true`
     );
+
 
   // A fresh Storage container runs database migrations before opening port 5000.
   // Kong can therefore return a transient 502/connection-refused for 30-90 seconds.

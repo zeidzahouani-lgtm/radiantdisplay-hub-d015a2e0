@@ -861,34 +861,42 @@ async function startLocalSupabaseEssentials(conn: Client, supaDir: string, log: 
 
 async function ensureLocalApiServices(conn: Client, supaDir: string, kongPort: string, anonKey: string, log: (m: string) => Promise<void> | void) {
   await log("→ Vérification Auth/REST/Storage derrière la gateway locale…");
-  const probeCmd =
+  const buildProbeCmd = (attempts: number, delaySeconds: number) =>
     `ANON=${shQuote(anonKey)} sh -c ` +
     shQuote(
-      `for i in $(seq 1 5); do ` +
-      `rest=$(curl -sS -m 2 -o /tmp/sf_rest.txt -w "%{http_code}" "http://127.0.0.1:${kongPort}/rest/v1/establishments?select=id&limit=1" -H "apikey: $ANON" -H "Authorization: Bearer $ANON" 2>/dev/null || true); ` +
-      `stor=$(curl -sS -m 2 -o /tmp/sf_storage.txt -w "%{http_code}" "http://127.0.0.1:${kongPort}/storage/v1/bucket" -H "apikey: $ANON" -H "Authorization: Bearer $ANON" 2>/dev/null || true); ` +
-      `auth=$(curl -sS -m 2 -o /tmp/sf_auth.txt -w "%{http_code}" "http://127.0.0.1:${kongPort}/auth/v1/health" -H "apikey: $ANON" 2>/dev/null || true); ` +
+      `for i in $(seq 1 ${attempts}); do ` +
+      `rest=$(curl -sS -m 4 -o /tmp/sf_rest.txt -w "%{http_code}" "http://127.0.0.1:${kongPort}/rest/v1/establishments?select=id&limit=1" -H "apikey: $ANON" -H "Authorization: Bearer $ANON" 2>/dev/null || true); ` +
+      `stor=$(curl -sS -m 4 -o /tmp/sf_storage.txt -w "%{http_code}" "http://127.0.0.1:${kongPort}/storage/v1/bucket" -H "apikey: $ANON" -H "Authorization: Bearer $ANON" 2>/dev/null || true); ` +
+      `auth=$(curl -sS -m 4 -o /tmp/sf_auth.txt -w "%{http_code}" "http://127.0.0.1:${kongPort}/auth/v1/health" -H "apikey: $ANON" 2>/dev/null || true); ` +
       `case "$rest:$stor:$auth" in 2*:2*:2*|2*:401:2*|2*:403:2*|401:2*:2*|403:2*:2*|401:401:2*|401:403:2*|403:401:2*|403:403:2*) echo "OK rest=$rest storage=$stor auth=$auth"; exit 0;; esac; ` +
-      `echo "WAIT rest=$rest storage=$stor auth=$auth"; sleep 2; done; ` +
+      `echo "WAIT $i/${attempts} rest=$rest storage=$stor auth=$auth"; sleep ${delaySeconds}; done; ` +
       `echo FAIL; echo REST_BODY; cat /tmp/sf_rest.txt 2>/dev/null || true; echo STORAGE_BODY; cat /tmp/sf_storage.txt 2>/dev/null || true`
     );
-  let probe = await exec(conn, probeCmd);
+
+  // A fresh Storage container runs database migrations before opening port 5000.
+  // Kong can therefore return a transient 502/connection-refused for 30-90 seconds.
+  let probe = await exec(conn, buildProbeCmd(30, 3));
   let output = `${probe.stdout}${probe.stderr}`;
   if (probe.code === 0 && /OK rest=/.test(output)) {
     await log(`✓ Services locaux joignables (${output.match(/OK rest=.*$/m)?.[0] || "OK"})`);
     return;
   }
 
-  await log("⚠ REST/Storage répondent mal (souvent HTTP 503). Redémarrage ciblé rapide des services locaux…");
-  const restart = await exec(conn, `cd ${supaDir} && docker compose up -d --no-deps db kong 2>&1; docker compose up -d --no-deps --force-recreate rest storage realtime auth 2>&1 || true`);
+  await log("⚠ Services incomplets après l’attente d’initialisation — réparation ciblée sans redémarrer les services déjà sains…");
+
+  // Storage is recovered separately so its actual logs and migration time are preserved.
+  // Recreating every API container at once used to interrupt healthy Auth/REST and reset
+  // Storage's initialization loop, causing a permanent connection-refused cycle.
+  const storageRecovery = await recoverStorageContainer(conn, supaDir, kongPort, anonKey, log);
+  const restart = await exec(conn, `cd ${supaDir} && docker compose up -d --no-deps db kong 2>&1; docker compose up -d --no-deps rest auth realtime 2>&1 || true`);
   await log((`${restart.stdout}${restart.stderr}`).slice(-1600));
-  probe = await exec(conn, probeCmd);
+  probe = await exec(conn, buildProbeCmd(20, 3));
   output = `${probe.stdout}${probe.stderr}`;
   if (!(probe.code === 0 && /OK rest=/.test(output))) {
-    const ps = await exec(conn, `cd ${supaDir} && docker compose ps && docker compose logs --tail=80 rest storage realtime kong 2>&1 || true`);
+    const ps = await exec(conn, `cd ${supaDir} && echo '--- CONTAINERS ---' && docker compose ps -a && echo '--- STORAGE ---' && docker compose logs --tail=120 storage 2>&1 && echo '--- REST/AUTH/KONG ---' && docker compose logs --tail=50 rest auth kong 2>&1 || true`);
     throw new Error(
       "La base locale, Auth ou Storage reste indisponible après redémarrage automatique. Détails: " +
-      `${output}\n${ps.stdout}${ps.stderr}`.slice(-2500)
+      `${output}\nStorage recovery: ${JSON.stringify(storageRecovery)}\n${ps.stdout}${ps.stderr}`.slice(-5000)
     );
   }
   await log(`✓ Services locaux réparés (${output.match(/OK rest=.*$/m)?.[0] || "OK"})`);

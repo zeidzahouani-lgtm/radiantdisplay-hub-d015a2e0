@@ -545,7 +545,19 @@ export function useScreenRealtime(screenId: string | undefined, options?: { prev
       await activateSession(screenData as ScreenData);
     };
 
-    init();
+    // Boot résilient : si /rest/v1 est injoignable, on ne reste jamais bloqué sur
+    // l'écran de chargement — on libère le rendu (contenu en cache / QR de secours)
+    // et on retente l'initialisation toutes les 10 s.
+    const bootWithRetry = () => {
+      init().catch((err) => {
+        console.warn("[useScreenRealtime] init failed, retry in 10s", err);
+        setLoading(false);
+        if (bootRetryRef.current) clearTimeout(bootRetryRef.current);
+        bootRetryRef.current = setTimeout(bootWithRetry, 10000);
+      });
+    };
+    bootWithRetry();
+
 
     // Preview mode: no offline cleanup needed
     if (previewOnly) return;

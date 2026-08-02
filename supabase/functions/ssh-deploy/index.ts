@@ -1637,6 +1637,15 @@ END $$;
     where lower(u.email) = lower('${DEFAULT_ADMIN_EMAIL}')
     limit 1
   `.trim();
+  const verifySqlNoEstablishments = `
+    select 'SCREENFLOW_ADMIN_OK|' ||
+           coalesce((select string_agg(distinct ur.role::text, ',' order by ur.role::text)
+                     from public.user_roles ur where ur.user_id = u.id), 'AUCUN') || '|0'
+    from auth.users u
+    where lower(u.email) = lower('${DEFAULT_ADMIN_EMAIL}')
+    limit 1
+  `.trim();
+
   const verify = await exec(conn, dockerPsqlSelect(supaDir, verifySql, false));
   const verifyOutput = `${verify.stdout || ""}\n${verify.stderr || ""}`;
   if (verify.code !== 0) {

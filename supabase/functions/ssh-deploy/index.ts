@@ -205,10 +205,25 @@ async function prepareEarlyWebDeployment(
   await uploadFile(conn, `${repoDir}/docker-compose.yml`, Buffer.from(compose));
   await patchRemoteBuildEntrypoint(conn, repoDir, log);
   await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
+
+  // A remote branch (or a shallow/partial clone) may not ship nginx.conf.
+  // Recreate a canonical proxy config instead of aborting the deployment:
+  // the definitive one is rewritten later with the resolved Kong port.
+  const hasNginx = await exec(conn, `[ -f ${repoDir}/nginx.conf ] && echo OK || echo NO`);
+  if (!(hasNginx.stdout || "").includes("OK")) {
+    const kongPort =
+      (await readRemoteEnv(conn, `${remoteDir}/supabase/.env`, "KONG_HTTP_PORT")) ||
+      body.supabase_kong_http_port ||
+      "8000";
+    await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(buildUploadRepairNginxConf(kongPort)));
+    await log(`✓ nginx.conf absent du dépôt distant : recréé (Kong ${kongPort})`);
+  }
+
   const required = await exec(conn, `[ -f ${repoDir}/Dockerfile ] && [ -f ${repoDir}/nginx.conf ] && echo OK || echo NO`);
   if (!(required.stdout || "").includes("OK")) {
     throw new Error(`Le dépôt ${repoDir} doit contenir Dockerfile et nginx.conf.`);
   }
+
   await log("✓ Déploiement web préparé tôt (reprise automatique possible)");
   await log("✓ Build différé jusqu'à l'écriture du proxy Auth/REST/Storage définitif");
 }

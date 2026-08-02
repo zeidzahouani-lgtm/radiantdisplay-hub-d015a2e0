@@ -3526,14 +3526,19 @@ async function runNetworkInspect(body: DeployBody, log: (m: string) => Promise<v
       return { container: name, ports: p };
     });
 
-    await log("→ Tests de connectivité interne (web → kong/db)…");
-    const webName = (await exec(conn, `cd ${remoteDir} && (docker compose ps -q web || docker-compose ps -q web) 2>/dev/null | head -1`)).stdout.trim();
+    await log("→ Tests du trajet réel navigateur → web → gateway locale…");
+    const kongPort = await readRemoteEnv(conn, `${supaDir}/.env`, "KONG_HTTP_PORT") || "8000";
+    const anonKey = await readRemoteEnv(conn, `${supaDir}/.env`, "ANON_KEY")
+      || await readRemoteEnv(conn, `${supaDir}/.env`, "SUPABASE_PUBLISHABLE_KEY");
+    const webName = (await exec(conn, `cd ${remoteDir}/repo && (docker compose ps -q web || docker-compose ps -q web) 2>/dev/null | head -1`)).stdout.trim();
     const tests: any[] = [];
     if (webName) {
-      const t1 = await exec(conn, `docker exec ${webName} sh -lc 'wget -q -T 3 -O - http://kong:8000/ 2>&1 | head -c 80' 2>&1`);
-      tests.push({ from: "web", to: "kong:8000", ok: (t1.code === 0), output: (t1.stdout || "").trim() || (t1.stderr || "").trim() });
-      const t2 = await exec(conn, `docker exec ${webName} sh -lc 'getent hosts db || nslookup db' 2>&1`);
-      tests.push({ from: "web", to: "db (DNS)", ok: t2.code === 0, output: (t2.stdout || "").trim().split("\n")[0] || "" });
+      const gatewayProbe = await exec(conn, `docker exec ${webName} sh -lc ${shQuote(`wget -q -T 5 -S -O /dev/null --header=${shQuote(`apikey: ${anonKey}`)} http://host.docker.internal:${kongPort}/rest/v1/ 2>&1`)} 2>&1`);
+      tests.push({ from: "web", to: `host.docker.internal:${kongPort}/rest/v1`, ok: gatewayProbe.code === 0, output: `${gatewayProbe.stdout}${gatewayProbe.stderr}`.trim().slice(-300) });
+      const appPort = body.app_port || "8080";
+      const proxyProbe = await exec(conn, `curl -sS -m 5 -o /dev/null -w "%{http_code}" http://127.0.0.1:${appPort}/rest/v1/ -H ${shQuote(`apikey: ${anonKey}`)} -H ${shQuote(`Authorization: Bearer ${anonKey}`)} 2>/dev/null || true`);
+      const proxyCode = (proxyProbe.stdout || "").trim();
+      tests.push({ from: "host", to: `web:${appPort}/rest/v1`, ok: /^(2\d\d|401|403|404)$/.test(proxyCode), output: `HTTP ${proxyCode || "000"}` });
     }
 
     await log("✓ Inspection terminée");

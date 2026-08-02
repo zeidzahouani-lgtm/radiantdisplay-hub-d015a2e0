@@ -2237,6 +2237,7 @@ ${localFunctionLocations}
       const appBasePath = body.vite_app_base_path || "/";
       const compose = `services:
   web:
+    container_name: screenflow-web
     build:
       context: .
       args:

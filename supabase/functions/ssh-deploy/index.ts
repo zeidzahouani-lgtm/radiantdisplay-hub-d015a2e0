@@ -861,15 +861,16 @@ async function startLocalSupabaseEssentials(conn: Client, supaDir: string, log: 
 }
 
 async function ensureLocalApiServices(conn: Client, supaDir: string, kongPort: string, anonKey: string, log: (m: string) => Promise<void> | void) {
-  await log("→ Vérification REST/Storage/Realtime derrière la gateway locale…");
+  await log("→ Vérification Auth/REST/Storage derrière la gateway locale…");
   const probeCmd =
     `ANON=${shQuote(anonKey)} sh -c ` +
     shQuote(
       `for i in $(seq 1 5); do ` +
       `rest=$(curl -sS -m 2 -o /tmp/sf_rest.txt -w "%{http_code}" "http://127.0.0.1:${kongPort}/rest/v1/establishments?select=id&limit=1" -H "apikey: $ANON" -H "Authorization: Bearer $ANON" 2>/dev/null || true); ` +
       `stor=$(curl -sS -m 2 -o /tmp/sf_storage.txt -w "%{http_code}" "http://127.0.0.1:${kongPort}/storage/v1/bucket" -H "apikey: $ANON" -H "Authorization: Bearer $ANON" 2>/dev/null || true); ` +
-      `case "$rest:$stor" in 2*:2*|2*:401|2*:403|401:2*|403:2*|401:401|401:403|403:401|403:403) echo "OK rest=$rest storage=$stor"; exit 0;; esac; ` +
-      `echo "WAIT rest=$rest storage=$stor"; sleep 1; done; ` +
+      `auth=$(curl -sS -m 2 -o /tmp/sf_auth.txt -w "%{http_code}" "http://127.0.0.1:${kongPort}/auth/v1/health" -H "apikey: $ANON" 2>/dev/null || true); ` +
+      `case "$rest:$stor:$auth" in 2*:2*:2*|2*:401:2*|2*:403:2*|401:2*:2*|403:2*:2*|401:401:2*|401:403:2*|403:401:2*|403:403:2*) echo "OK rest=$rest storage=$stor auth=$auth"; exit 0;; esac; ` +
+      `echo "WAIT rest=$rest storage=$stor auth=$auth"; sleep 2; done; ` +
       `echo FAIL; echo REST_BODY; cat /tmp/sf_rest.txt 2>/dev/null || true; echo STORAGE_BODY; cat /tmp/sf_storage.txt 2>/dev/null || true`
     );
   let probe = await exec(conn, probeCmd);
@@ -886,12 +887,10 @@ async function ensureLocalApiServices(conn: Client, supaDir: string, kongPort: s
   output = `${probe.stdout}${probe.stderr}`;
   if (!(probe.code === 0 && /OK rest=/.test(output))) {
     const ps = await exec(conn, `cd ${supaDir} && docker compose ps && docker compose logs --tail=80 rest storage realtime kong 2>&1 || true`);
-    await log(
-      "⚠ La gateway locale répond mais REST/Storage restent indisponibles après réparation rapide. " +
-      "Le déploiement continue pour livrer l'interface; ouvrez /admin/health puis redémarrez les conteneurs locaux si la DB reste KO. Détails: " +
+    throw new Error(
+      "La base locale, Auth ou Storage reste indisponible après redémarrage automatique. Détails: " +
       `${output}\n${ps.stdout}${ps.stderr}`.slice(-2500)
     );
-    return;
   }
   await log(`✓ Services locaux réparés (${output.match(/OK rest=.*$/m)?.[0] || "OK"})`);
 }
@@ -1833,7 +1832,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
           `${remoteDir}/repo`,
           remoteDir,
           appPort,
-          supaBrowserUrl,
+          "__SCREENFLOW_SAME_ORIGIN__",
           anonKey,
           "local",
           log,
@@ -1957,7 +1956,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
           `${remoteDir}/repo`,
           remoteDir,
           appPort,
-          supaBrowserUrl,
+          "__SCREENFLOW_SAME_ORIGIN__",
           anonKey,
           "local",
           log,
@@ -2129,7 +2128,7 @@ ${localFunctionLocations}
     build:
       context: .
       args:
-        VITE_SUPABASE_URL: '${escEnv(supabaseUrlOverride || body.vite_supabase_url || "")}'
+        VITE_SUPABASE_URL: '${escEnv(installSupabase ? "__SCREENFLOW_SAME_ORIGIN__" : (supabaseUrlOverride || body.vite_supabase_url || ""))}'
         VITE_SUPABASE_PUBLISHABLE_KEY: '${escEnv(supabaseAnonOverride || body.vite_supabase_key || "")}'
         VITE_SUPABASE_PROJECT_ID: '${escEnv(supabaseProjectIdOverride || body.vite_supabase_project_id || "")}'
         VITE_PUBLIC_APP_URL: '${escEnv(publicAppUrl)}'
@@ -2358,7 +2357,7 @@ p = pathlib.Path(${JSON.stringify(`${repoDir}/docker-compose.yml`)})
 s = p.read_text()
 url = base64.b64decode(${JSON.stringify(btoa(publicBase))}).decode()
 key = base64.b64decode(${JSON.stringify(btoa(anonKey))}).decode()
-s = re.sub(r"VITE_SUPABASE_URL:\\s*.*", f"VITE_SUPABASE_URL: '{url}'", s)
+s = re.sub(r"VITE_SUPABASE_URL:\\s*.*", "VITE_SUPABASE_URL: '__SCREENFLOW_SAME_ORIGIN__'", s)
 s = re.sub(r"VITE_SUPABASE_PUBLISHABLE_KEY:\\s*.*", f"VITE_SUPABASE_PUBLISHABLE_KEY: '{key}'", s)
 s = re.sub(r"VITE_SUPABASE_PROJECT_ID:\\s*.*", "VITE_SUPABASE_PROJECT_ID: 'local'", s)
 if re.search(r"VITE_PUBLIC_APP_URL:\\s*", s):
@@ -2375,12 +2374,19 @@ PY`;
   const repairAuthEnvB64 = btoa(buildLocalAuthUrlEnvPatch(body, appPort, publicBase));
   await exec(conn, `cd ${supaDir} && for k in SITE_URL API_EXTERNAL_URL GOTRUE_EXTERNAL_URL ADDITIONAL_REDIRECT_URLS SUPABASE_PUBLIC_URL; do sed -i "/^$k=/d" .env; done && printf '%s' '${repairAuthEnvB64}' | base64 -d >> .env && docker compose restart auth storage rest kong 2>&1 || true`);
   await exec(conn, `cd ${repoDir} && (docker compose up -d --build web || docker-compose up -d --build web) 2>&1`);
-  // Vérification depuis le serveur via 127.0.0.1 (évite DNS public + cert auto-signé)
-  const probe = await exec(conn, `curl -sS -m 10 -o /tmp/sf_proxy_bucket.txt -w "%{http_code}" ${shQuote(`http://127.0.0.1:${kongPort}/storage/v1/bucket`)} -H ${shQuote(`apikey: ${anonKey}`)} -H ${shQuote(`Authorization: Bearer ${anonKey}`)} 2>/dev/null || true`);
-  const probeRest = await exec(conn, `curl -sS -m 10 -o /dev/null -w "%{http_code}" ${shQuote(`http://127.0.0.1:${kongPort}/rest/v1/`)} -H ${shQuote(`apikey: ${anonKey}`)} -H ${shQuote(`Authorization: Bearer ${anonKey}`)} 2>/dev/null || true`);
-  const probeAuth = await exec(conn, `curl -sS -m 10 -o /dev/null -w "%{http_code}" ${shQuote(`http://127.0.0.1:${kongPort}/auth/v1/health`)} 2>/dev/null || true`);
+  await ensureLocalApiServices(conn, supaDir, kongPort, anonKey, log);
+  const proxyBase = `http://127.0.0.1:${appPort}`;
+  const probe = await exec(conn, `curl -sS -m 10 -o /tmp/sf_proxy_bucket.txt -w "%{http_code}" ${shQuote(`${proxyBase}/storage/v1/bucket`)} -H ${shQuote(`apikey: ${anonKey}`)} -H ${shQuote(`Authorization: Bearer ${anonKey}`)} 2>/dev/null || true`);
+  const probeRest = await exec(conn, `curl -sS -m 10 -o /dev/null -w "%{http_code}" ${shQuote(`${proxyBase}/rest/v1/`)} -H ${shQuote(`apikey: ${anonKey}`)} -H ${shQuote(`Authorization: Bearer ${anonKey}`)} 2>/dev/null || true`);
+  const probeAuth = await exec(conn, `curl -sS -m 10 -o /dev/null -w "%{http_code}" ${shQuote(`${proxyBase}/auth/v1/health`)} -H ${shQuote(`apikey: ${anonKey}`)} 2>/dev/null || true`);
+  const storageCode = (probe.stdout || "").trim();
+  const restCode = (probeRest.stdout || "").trim();
+  const authCode = (probeAuth.stdout || "").trim();
+  if (!/^(2\d\d|401|403)$/.test(storageCode) || !/^(2\d\d|401|403)$/.test(restCode) || !/^2\d\d$/.test(authCode)) {
+    throw new Error(`Le proxy web local ne relaie pas correctement la base/Auth : Storage HTTP ${storageCode || "000"}, REST HTTP ${restCode || "000"}, Auth HTTP ${authCode || "000"}`);
+  }
   await log(`✓ URL API corrigée. Ouvrez l'application en HTTP : ${publicBase}`);
-  await log(`  • Vérif locale 127.0.0.1:${kongPort} → Storage HTTP ${(probe.stdout || "").trim() || "n/a"}, REST HTTP ${(probeRest.stdout || "").trim() || "n/a"}, Auth HTTP ${(probeAuth.stdout || "").trim() || "n/a"}`);
+  await log(`  • Vérif via le conteneur web ${proxyBase} → Storage HTTP ${storageCode}, REST HTTP ${restCode}, Auth HTTP ${authCode}`);
   (globalThis as any).__lastDeployResult = { action: "repair_local_api_url", ok: true, url: publicBase, supabase_local: { url: publicBase, anon_key: anonKey } };
 }
 

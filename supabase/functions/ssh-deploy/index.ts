@@ -251,7 +251,7 @@ async function pollDetachedCompose(
   while (Date.now() < deadlineMs) {
     const res = await exec(
       conn,
-      `if [ -f ${stateDir}/build.code ]; then echo "DONE:$(cat ${stateDir}/build.code)"; else echo RUNNING; fi; echo '---'; tail -n 6 ${stateDir}/build.log 2>/dev/null`,
+      `if [ -f ${stateDir}/build.code ]; then echo "DONE:$(cat ${stateDir}/build.code)"; else echo RUNNING; fi; echo '---'; tail -n 40 ${stateDir}/build.log 2>/dev/null`,
     );
     const out = res.stdout || "";
     const [head, ...rest] = out.split("---");
@@ -260,7 +260,7 @@ async function pollDetachedCompose(
       const code = parseInt(head.split("DONE:")[1].trim(), 10);
       return { done: true, code: Number.isNaN(code) ? 0 : code, tail: lastTail };
     }
-    if (lastTail) await log("   … " + lastTail.split("\n").slice(-2).join(" | ").slice(0, 200));
+    if (lastTail) await log("   … " + lastTail.split("\n").slice(-3).join(" | ").slice(0, 400));
     await new Promise((r) => setTimeout(r, 8000));
   }
   return { done: false, code: null, tail: lastTail };

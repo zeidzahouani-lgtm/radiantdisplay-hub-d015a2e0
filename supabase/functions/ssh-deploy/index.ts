@@ -158,7 +158,7 @@ async function startDetachedCompose(conn: Client, repoDir: string, stateDir: str
     `'cd ${repoDir} || exit 1' ` +
     `'if docker compose version >/dev/null 2>&1; then COMPOSE=(docker compose); elif command -v docker-compose >/dev/null 2>&1; then COMPOSE=(docker-compose); else echo "Docker Compose est introuvable" > ${stateDir}/build.log; echo 127 > ${stateDir}/build.code; exit 127; fi' ` +
     `'"\${COMPOSE[@]}" up -d --build > ${stateDir}/build.log 2>&1' ` +
-    `'echo $? > ${stateDir}/build.code' > ${script} && ` +
+    `'code=$?; echo $code > ${stateDir}/build.code; rm -rf ${stateDir}/build.lock; exit $code' > ${script} && ` +
     `chmod +x ${script} && rm -f ${stateDir}/build.code && : > ${stateDir}/build.log && ` +
     `(setsid nohup ${script} >/dev/null 2>&1 & ) && echo STARTED`;
   const res = await exec(conn, cmd);
@@ -1562,7 +1562,14 @@ async function runDeploymentJob(
       await runDeployment(body, log);
     }
     const result = directResult ?? (globalThis as any).__lastDeployResult ?? null;
-    await persist({ status: "success", logs, result });
+    const resultFailed = !!result && typeof result === "object" && "ok" in result && result.ok === false;
+    if (resultFailed) {
+      const error = String(result.cause || "L'opération n'a pas confirmé son succès.");
+      logs.push("✗ ERROR: " + error);
+      await persist({ status: "error", logs, result, error });
+    } else {
+      await persist({ status: "success", logs, result });
+    }
   } catch (e: any) {
     const detail = `${e?.message || String(e)}${e?.stack ? ` | ${String(e.stack).split("\n").slice(0, 4).join(" ⏎ ")}` : ""}`;
     logs.push("✗ ERROR: " + detail);
@@ -3264,12 +3271,24 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
     if ((webLogs.stdout || "").trim()) await log("ℹ Logs conteneur web :\n" + webLogs.stdout.slice(-1200));
     if (!result.cause && !/Up\s/i.test(state.stdout)) result.cause = "Conteneur web arrêté ou jamais construit";
 
-    // 2. Rebuild (detached so the edge runtime timeout cannot kill it)
+    // 2. Rebuild (detached so the edge runtime timeout cannot kill it). Use an
+    // atomic directory lock so a double click cannot remove a container while
+    // another repair is still building it.
+    const stateDir = `${remoteDir}/.build`;
+    const lock = await exec(conn, `mkdir -p ${stateDir}; if mkdir ${stateDir}/build.lock 2>/dev/null; then echo LOCKED; elif [ -f ${stateDir}/build.code ]; then rm -rf ${stateDir}/build.lock && mkdir ${stateDir}/build.lock && echo LOCKED; else echo BUSY; fi`);
+    if (!(lock.stdout || "").includes("LOCKED")) {
+      result.cause = "Une reconstruction web est déjà en cours. Utilisez « Vérifier le build » avant de relancer une réparation.";
+      throw new Error(result.cause);
+    }
     await log("→ Suppression des anciens conteneurs web/orphelins…");
     await exec(conn, `cd ${repoDir} && (docker compose down --remove-orphans 2>&1 || docker-compose down --remove-orphans 2>&1 || true); docker rm -f screenflow-web 2>/dev/null || true`);
     await log("→ Reconstruction du conteneur web en arrière-plan (docker compose up -d --build)…");
-    const stateDir = `${remoteDir}/.build`;
-    await startDetachedCompose(conn, repoDir, stateDir);
+    try {
+      await startDetachedCompose(conn, repoDir, stateDir);
+    } catch (error) {
+      await exec(conn, `rm -rf ${stateDir}/build.lock`);
+      throw error;
+    }
     const res = await pollDetachedCompose(conn, stateDir, Date.now() + 4 * 60 * 1000, log);
     if (!res.done) {
       await log("⏳ Build toujours en cours — cliquez sur « Vérifier le build » dans quelques minutes.");

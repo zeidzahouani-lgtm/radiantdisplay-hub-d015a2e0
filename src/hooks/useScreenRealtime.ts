@@ -88,6 +88,8 @@ export function useScreenRealtime(screenId: string | undefined, options?: { prev
   const schedulesRef = useRef<ScheduleRow[]>([]);
   const realScreenIdRef = useRef<string | undefined>(undefined);
   const heartbeatRef = useRef<ReturnType<typeof setInterval>>();
+  const bootRetryRef = useRef<ReturnType<typeof setTimeout>>();
+
   const screenRef = useRef<ScreenData | null>(null);
   const playlistRef = useRef<PlaylistItem[]>([]);
   const currentIndexRef = useRef(0);

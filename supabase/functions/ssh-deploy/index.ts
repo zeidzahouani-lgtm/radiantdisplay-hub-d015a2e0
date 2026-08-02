@@ -964,12 +964,15 @@ async function ensureLocalApiServices(conn: Client, supaDir: string, kongPort: s
   probe = await exec(conn, buildProbeCmd(20, 3));
   output = `${probe.stdout}${probe.stderr}`;
   if (!(probe.code === 0 && /OK rest=/.test(output))) {
-    const ps = await exec(conn, `cd ${supaDir} && echo '--- CONTAINERS ---' && docker compose ps -a && echo '--- STORAGE DIRECT ---' && CID=$(docker compose ps -q storage 2>/dev/null | head -1); if [ -n "$CID" ]; then docker inspect -f 'state={{.State.Status}} running={{.State.Running}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} ip={{range.NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$CID"; IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CID"); curl -sS -m 4 -w '\nHTTP=%{http_code}\n' "http://$IP:5000/status" 2>&1 || true; fi; echo '--- STORAGE LOGS ---' && docker compose logs --tail=120 storage 2>&1 && echo '--- REST/AUTH/KONG ---' && docker compose logs --tail=50 rest auth kong 2>&1 || true`);
+    const codes = output.match(/^(?:FAIL|WAIT[^\n]*?) ?rest=[^\n]*$/gm)?.slice(-1)[0] || "codes indisponibles";
+    const ps = await exec(conn, `cd ${supaDir} && echo '--- CONTAINERS ---' && docker compose ps -a && echo '--- STORAGE DIRECT ---' && CID=$(docker compose ps -q storage 2>/dev/null | head -1); if [ -n "$CID" ]; then docker inspect -f 'state={{.State.Status}} running={{.State.Running}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} ip={{range.NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$CID"; IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CID"); curl -sS -m 4 -w '\nHTTP=%{http_code}\n' "http://$IP:5000/status" 2>&1 || true; fi; echo '--- STORAGE LOGS ---' && docker compose logs --tail=80 storage 2>&1 && echo '--- REST/AUTH/KONG ---' && docker compose logs --tail=40 rest auth kong 2>&1 || true`);
     throw new Error(
-      "La base locale, Auth ou Storage reste indisponible après redémarrage automatique. Détails: " +
-      `${output}\nStorage recovery: ${JSON.stringify(storageRecovery)}\n${ps.stdout}${ps.stderr}`.slice(-5000)
+      `La base locale, Auth ou Storage reste indisponible après redémarrage automatique. Derniers codes HTTP via Kong: ${codes}. ` +
+      `Storage recovery: ${JSON.stringify(storageRecovery)}. Détails: ` +
+      `${output}\n${ps.stdout}${ps.stderr}`.slice(-4000)
     );
   }
+
   await log(`✓ Services locaux réparés (${output.match(/OK rest=.*$/m)?.[0] || "OK"})`);
 }
 

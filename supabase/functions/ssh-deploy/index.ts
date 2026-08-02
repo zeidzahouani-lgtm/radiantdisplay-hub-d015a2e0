@@ -266,6 +266,18 @@ async function pollDetachedCompose(
   return { done: false, code: null, tail: lastTail };
 }
 
+async function readDetachedBuildFailure(conn: Client, stateDir: string) {
+  const res = await exec(
+    conn,
+    `LOG=${shQuote(`${stateDir}/build.log`)}; ` +
+      `if [ ! -s "$LOG" ]; then echo "Journal Docker vide ou absent"; exit 0; fi; ` +
+      `echo '--- ERREURS DÉTECTÉES ---'; ` +
+      `grep -nEi '(^|[^a-z])(error|failed|failure|fatal|npm err|ts[0-9]{4})([^a-z]|$)' "$LOG" | tail -n 35 || true; ` +
+      `echo '--- FIN DU BUILD ---'; tail -n 100 "$LOG"`,
+  );
+  return `${res.stdout || ""}${res.stderr || ""}`.trim().slice(-12000);
+}
+
 function uploadFile(conn: Client, remotePath: string, content: Buffer): Promise<void> {
   return new Promise((resolve, reject) => {
     conn.sftp((err: any, sftp: any) => {
@@ -3129,6 +3141,20 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
       throw new Error(`Aucun docker-compose.yml applicatif dans ${repoDir}. Lancez un déploiement complet.`);
     }
 
+
+    // Normalize old remote checkouts before rebuilding. A repair can target a
+    // repository deployed by an earlier function version, so it must not rely
+    // on the full deployment path having already applied these compatibility fixes.
+    await log("→ Normalisation de la configuration de build distante…");
+    await patchRemoteBuildEntrypoint(conn, repoDir, log);
+    await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
+    const composeConfig = await exec(conn, `cd ${repoDir} && (docker compose config --quiet || docker-compose config --quiet) 2>&1`);
+    if (composeConfig.code !== 0) {
+      const detail = `${composeConfig.stdout || ""}${composeConfig.stderr || ""}`.trim().slice(-4000);
+      result.cause = `Configuration docker-compose invalide${detail ? ` : ${detail}` : ""}`;
+      throw new Error(result.cause);
+    }
+
     // 1. Why is it down?
     await log("→ Analyse de l'état du conteneur web…");
     const state = await exec(conn, `cd ${repoDir} && (docker compose ps -a || docker-compose ps -a) 2>&1`);
@@ -3155,7 +3181,18 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
     }
     await log(res.tail.slice(-1500));
     if (res.code !== 0) {
-      result.cause = "Échec du build Docker (voir " + stateDir + "/build.log)";
+      const diagnostics = await readDetachedBuildFailure(conn, stateDir);
+      if (diagnostics) await log("✗ Diagnostic complet du build :\n" + diagnostics);
+      const concise = diagnostics
+        .split("\n")
+        .filter((line) => /error|failed|failure|fatal|npm err|ts\d{4}/i.test(line))
+        .slice(-5)
+        .join(" | ")
+        .slice(0, 1800);
+      result.build_log = diagnostics;
+      result.cause = concise
+        ? `Échec du build Docker : ${concise}`
+        : `Échec du build Docker (journal: ${stateDir}/build.log)`;
       throw new Error(result.cause);
     }
 

@@ -185,6 +185,14 @@ async function prepareEarlyWebDeployment(
   log: (m: string) => Promise<void> | void,
 ) {
   const publicAppUrl = resolveBrowserAppBase(body, appPort, false);
+  // The Supabase client validates its URL synchronously. Older remote
+  // checkouts can bypass our Vite alias and pass the same-origin marker
+  // directly to createClient(), which leaves the page completely blank.
+  // Always provide a valid browser URL at build time; Nginx proxies the API
+  // paths on that same public application origin.
+  const browserSupabaseUrl = ["__SCREENFLOW_SAME_ORIGIN__", "same-origin", "runtime:same-origin"].includes(supabaseUrl)
+    ? publicAppUrl
+    : supabaseUrl;
   const quoteYaml = (value: string) => `'${(value || "").replace(/'/g, "''")}'`;
   const compose = `services:
   web:
@@ -192,7 +200,7 @@ async function prepareEarlyWebDeployment(
     build:
       context: .
       args:
-        VITE_SUPABASE_URL: ${quoteYaml(supabaseUrl)}
+        VITE_SUPABASE_URL: ${quoteYaml(browserSupabaseUrl)}
         VITE_SUPABASE_PUBLISHABLE_KEY: ${quoteYaml(supabaseKey)}
         VITE_SUPABASE_PROJECT_ID: ${quoteYaml(projectId)}
         VITE_PUBLIC_APP_URL: ${quoteYaml(publicAppUrl)}
@@ -585,6 +593,36 @@ PY`;
     if (out) await log(`  • Port ${p}: ${out.slice(-200)}`);
   }
   await log("✓ Libération des ports terminée");
+}
+
+async function allowRemoteWebPorts(
+  conn: Client,
+  ports: string[],
+  sudoPrefix: string,
+  log: (m: string) => Promise<void> | void,
+) {
+  const uniquePorts = Array.from(new Set(ports.map(String).filter(Boolean)));
+  if (uniquePorts.length === 0) return;
+  uniquePorts.forEach((port) => validatePortValue("Pare-feu web", port));
+  await log(`→ Autorisation des ports web dans le pare-feu: ${uniquePorts.join(", ")}…`);
+  const portArgs = uniquePorts.map((port) => `${port}/tcp`).join(" ");
+  const command = `${sudoPrefix}sh -c '
+set -e
+if command -v ufw >/dev/null 2>&1; then
+  for rule in ${portArgs}; do ufw allow "$rule" >/dev/null; done
+  echo FIREWALL=ufw
+elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+  for rule in ${portArgs}; do firewall-cmd --permanent --add-port="$rule" >/dev/null; done
+  firewall-cmd --reload >/dev/null
+  echo FIREWALL=firewalld
+else
+  echo FIREWALL=none
+fi'`;
+  const result = await exec(conn, command);
+  const output = `${result.stdout || ""}${result.stderr || ""}`;
+  if (output.includes("FIREWALL=ufw")) await log("✓ Règles UFW appliquées");
+  else if (output.includes("FIREWALL=firewalld")) await log("✓ Règles firewalld appliquées");
+  else await log("ℹ Aucun pare-feu UFW/firewalld actif détecté sur le serveur");
 }
 
 async function checkRemotePortsAvailable(
@@ -1808,6 +1846,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
 
       const ignoredPortDirs = forceFreshInstall ? [] : [`${remoteDir}/repo`, `${remoteDir}/supabase`];
       await checkRemotePortsAvailable(conn, requestedPorts, log, ignoredPortDirs);
+      await allowRemoteWebPorts(conn, [appPort, ...(enableHttps ? [httpsPort] : [])], sudoPrefix, log);
 
       if (isExistingInstall) {
         await log(`✓ Installation existante détectée dans ${remoteDir} — mode mise à jour activé`);
@@ -2229,10 +2268,11 @@ ${localFunctionLocations}
       const appBasePath = body.vite_app_base_path || "/";
       const compose = `services:
   web:
+    container_name: screenflow-web
     build:
       context: .
       args:
-        VITE_SUPABASE_URL: '${escEnv(installSupabase ? "__SCREENFLOW_SAME_ORIGIN__" : (supabaseUrlOverride || body.vite_supabase_url || ""))}'
+        VITE_SUPABASE_URL: '${escEnv(installSupabase ? publicAppUrl : (supabaseUrlOverride || body.vite_supabase_url || ""))}'
         VITE_SUPABASE_PUBLISHABLE_KEY: '${escEnv(supabaseAnonOverride || body.vite_supabase_key || "")}'
         VITE_SUPABASE_PROJECT_ID: '${escEnv(supabaseProjectIdOverride || body.vite_supabase_project_id || "")}'
         VITE_PUBLIC_APP_URL: '${escEnv(publicAppUrl)}'
@@ -2323,6 +2363,28 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
     const appCode = (appCheck.stdout || "").trim();
     connectivity.app = { ok: /^(200|301|302|304)$/.test(appCode), detail: `HTTP ${appCode} sur ${localAppUrl} (vérification 127.0.0.1)` };
     await log(`  • App         : ${connectivity.app.ok ? "✓" : "✗"} ${connectivity.app.detail}`);
+
+    // A loopback success does not prove that the host firewall/provider allows
+    // remote traffic. Probe the exact browser URL from outside the SSH server.
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 12_000);
+      const publicResponse = await fetch(appUrl, { method: "HEAD", redirect: "manual", signal: controller.signal });
+      clearTimeout(timeout);
+      connectivity.public_app = {
+        ok: publicResponse.status >= 200 && publicResponse.status < 500,
+        detail: `HTTP ${publicResponse.status} sur ${appUrl}`,
+      };
+    } catch (publicError: any) {
+      connectivity.public_app = {
+        ok: false,
+        detail: `${appUrl} inaccessible depuis Internet (${publicError?.name === "AbortError" ? "délai dépassé" : "connexion refusée"})`,
+      };
+    }
+    await log(`  • Accès public : ${connectivity.public_app.ok ? "✓" : "⚠"} ${connectivity.public_app.detail}`);
+    if (connectivity.app.ok && !connectivity.public_app.ok) {
+      await log("⚠ Le conteneur fonctionne localement mais reste inaccessible à distance. Vérifiez aussi le pare-feu réseau/security group de l'hébergeur, que le serveur ne peut pas modifier lui-même.");
+    }
 
     if (installSupabase) {
       // REST
@@ -2483,7 +2545,7 @@ p = pathlib.Path(${JSON.stringify(`${repoDir}/docker-compose.yml`)})
 s = p.read_text()
 url = base64.b64decode(${JSON.stringify(btoa(publicBase))}).decode()
 key = base64.b64decode(${JSON.stringify(btoa(anonKey))}).decode()
-s = re.sub(r"VITE_SUPABASE_URL:\\s*.*", "VITE_SUPABASE_URL: '__SCREENFLOW_SAME_ORIGIN__'", s)
+s = re.sub(r"VITE_SUPABASE_URL:\\s*.*", f"VITE_SUPABASE_URL: '{url}'", s)
 s = re.sub(r"VITE_SUPABASE_PUBLISHABLE_KEY:\\s*.*", f"VITE_SUPABASE_PUBLISHABLE_KEY: '{key}'", s)
 s = re.sub(r"VITE_SUPABASE_PROJECT_ID:\\s*.*", "VITE_SUPABASE_PROJECT_ID: 'local'", s)
 if re.search(r"VITE_PUBLIC_APP_URL:\\s*", s):
@@ -3231,7 +3293,7 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
     build:
       context: .
       args:
-        VITE_SUPABASE_URL: '__SCREENFLOW_SAME_ORIGIN__'
+        VITE_SUPABASE_URL: ${quoteYaml(publicBase)}
         VITE_SUPABASE_PUBLISHABLE_KEY: ${quoteYaml(anonKey)}
         VITE_SUPABASE_PROJECT_ID: ${quoteYaml(projectId)}
         VITE_PUBLIC_APP_URL: ${quoteYaml(publicBase)}
@@ -3347,6 +3409,19 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
     if (!result.running || result.app_http !== "200") {
       const failureLogs = await exec(conn, `cd ${repoDir} && (docker compose logs --tail=120 web || docker-compose logs --tail=120 web) 2>&1 || true`);
       result.cause = `Le conteneur web ne sert pas l'application (Docker ${result.container_state || "absent"}, HTTP ${result.app_http}). ${(failureLogs.stdout || failureLogs.stderr || "").slice(-2500)}`;
+      throw new Error(result.cause);
+    }
+
+    // HTTP 200 only proves that Nginx returned index.html. Also inspect the
+    // generated browser bundle: passing our marker directly to createClient()
+    // throws synchronously and produces a completely blank page.
+    const bundleCheck = await exec(conn, `docker exec ${cid} sh -c 'if grep -R -q "const [A-Za-z0-9_$]*=\"__SCREENFLOW_SAME_ORIGIN__\".*createClient\|YTe(\"__SCREENFLOW_SAME_ORIGIN__\"" /usr/share/nginx/html/assets 2>/dev/null; then echo INVALID_MARKER; else echo OK; fi'`);
+    result.browser_bundle_ok = (bundleCheck.stdout || "").includes("OK");
+    await log(result.browser_bundle_ok
+      ? "✓ Bundle navigateur valide (URL backend HTTP absolue)"
+      : "✗ Bundle navigateur invalide : marqueur same-origin transmis directement au client backend");
+    if (!result.browser_bundle_ok) {
+      result.cause = "Le serveur répond HTTP 200 mais le JavaScript produit une page blanche : URL backend invalide dans le bundle. Relancez la réparation avec cette version.";
       throw new Error(result.cause);
     }
 

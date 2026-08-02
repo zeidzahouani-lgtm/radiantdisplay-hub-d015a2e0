@@ -262,7 +262,7 @@ CMD ["nginx", "-g", "daemon off;"]
 
 s = dockerfile.read_text()
 s = s.replace('RUN npm run build:local', 'RUN npm run build -- --mode selfhosted')
-s = s.replace('RUN npm run build\n', 'RUN npm run build -- --mode selfhosted\n')
+s = s.replace('RUN npm run build\\n', 'RUN npm run build -- --mode selfhosted\\n')
 dockerfile.write_text(s)
 
 data = json.loads(package_json.read_text())

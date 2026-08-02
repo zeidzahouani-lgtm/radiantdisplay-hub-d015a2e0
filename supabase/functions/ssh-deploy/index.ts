@@ -1581,16 +1581,28 @@ END $$;
   const promoted = await exec(conn, dockerPsql(supaDir, roleB64));
   if (promoted.code !== 0) throw new Error("Compte Auth créé, mais attribution du rôle admin échouée : " + (promoted.stdout + promoted.stderr).slice(-800));
 
-  // Vérification stricte des droits obtenus
-  const verify = await exec(conn, dockerPsqlSelect(supaDir,
-    `select coalesce(string_agg(distinct r.role::text, ','), 'AUCUN') || '|' ||
-            (select count(*)::text from public.user_establishments ue join auth.users u2 on u2.id=ue.user_id where lower(u2.email)=lower('${DEFAULT_ADMIN_EMAIL}') and ue.role='admin')
-     from public.user_roles r join auth.users u on u.id=r.user_id
-     where lower(u.email)=lower('${DEFAULT_ADMIN_EMAIL}')`));
-  const parsed = (verify.stdout || "").split("\n").map((l) => l.trim()).find((l) => l.includes("|")) || "";
-  const [roles, estCount] = parsed.split("|");
-  if (!roles || !roles.includes("admin")) {
-    throw new Error("Le rôle admin global n'a pas pu être vérifié après réparation. Sortie : " + (verify.stdout + verify.stderr).slice(-600));
+  // Vérification stricte des droits obtenus. Ne jamais masquer stderr/code ici :
+  // l'ancien mode silencieux transformait une erreur psql en sortie vide.
+  const verifySql = `
+    select 'SCREENFLOW_ADMIN_OK|' ||
+           coalesce((select string_agg(distinct ur.role::text, ',' order by ur.role::text)
+                     from public.user_roles ur where ur.user_id = u.id), 'AUCUN') || '|' ||
+           coalesce((select count(*)::text from public.user_establishments ue
+                     where ue.user_id = u.id and ue.role = 'admin'), '0')
+    from auth.users u
+    where lower(u.email) = lower('${DEFAULT_ADMIN_EMAIL}')
+    limit 1
+  `.trim();
+  const verify = await exec(conn, dockerPsqlSelect(supaDir, verifySql, false));
+  const verifyOutput = `${verify.stdout || ""}\n${verify.stderr || ""}`;
+  if (verify.code !== 0) {
+    throw new Error("Droits admin attribués, mais leur contrôle PostgreSQL a échoué : " + verifyOutput.trim().slice(-800));
+  }
+  const parsed = verifyOutput.split("\n").map((line) => line.trim())
+    .find((line) => line.startsWith("SCREENFLOW_ADMIN_OK|")) || "";
+  const [, roles = "", estCount = "0"] = parsed.split("|");
+  if (!parsed || !roles.split(",").includes("admin")) {
+    throw new Error("Le rôle admin global est absent après réparation. Contrôle : " + (verifyOutput.trim() || "aucune ligne retournée").slice(-800));
   }
   await log(`✓ Droits super admin confirmés pour ${DEFAULT_ADMIN_EMAIL} — rôles globaux : ${roles} ; établissements en admin : ${estCount || 0}`);
 }

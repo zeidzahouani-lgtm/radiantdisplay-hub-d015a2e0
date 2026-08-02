@@ -595,6 +595,36 @@ PY`;
   await log("✓ Libération des ports terminée");
 }
 
+async function allowRemoteWebPorts(
+  conn: Client,
+  ports: string[],
+  sudoPrefix: string,
+  log: (m: string) => Promise<void> | void,
+) {
+  const uniquePorts = Array.from(new Set(ports.map(String).filter(Boolean)));
+  if (uniquePorts.length === 0) return;
+  uniquePorts.forEach((port) => validatePortValue("Pare-feu web", port));
+  await log(`→ Autorisation des ports web dans le pare-feu: ${uniquePorts.join(", ")}…`);
+  const portArgs = uniquePorts.map((port) => `${port}/tcp`).join(" ");
+  const command = `${sudoPrefix}sh -c '
+set -e
+if command -v ufw >/dev/null 2>&1; then
+  for rule in ${portArgs}; do ufw allow "$rule" >/dev/null; done
+  echo FIREWALL=ufw
+elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+  for rule in ${portArgs}; do firewall-cmd --permanent --add-port="$rule" >/dev/null; done
+  firewall-cmd --reload >/dev/null
+  echo FIREWALL=firewalld
+else
+  echo FIREWALL=none
+fi'`;
+  const result = await exec(conn, command);
+  const output = `${result.stdout || ""}${result.stderr || ""}`;
+  if (output.includes("FIREWALL=ufw")) await log("✓ Règles UFW appliquées");
+  else if (output.includes("FIREWALL=firewalld")) await log("✓ Règles firewalld appliquées");
+  else await log("ℹ Aucun pare-feu UFW/firewalld actif détecté sur le serveur");
+}
+
 async function checkRemotePortsAvailable(
   conn: Client,
   ports: Array<{ label: string; value: string; required: boolean }>,
@@ -1816,6 +1846,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
 
       const ignoredPortDirs = forceFreshInstall ? [] : [`${remoteDir}/repo`, `${remoteDir}/supabase`];
       await checkRemotePortsAvailable(conn, requestedPorts, log, ignoredPortDirs);
+      await allowRemoteWebPorts(conn, [appPort, ...(enableHttps ? [httpsPort] : [])], sudoPrefix, log);
 
       if (isExistingInstall) {
         await log(`✓ Installation existante détectée dans ${remoteDir} — mode mise à jour activé`);
@@ -2332,6 +2363,28 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
     const appCode = (appCheck.stdout || "").trim();
     connectivity.app = { ok: /^(200|301|302|304)$/.test(appCode), detail: `HTTP ${appCode} sur ${localAppUrl} (vérification 127.0.0.1)` };
     await log(`  • App         : ${connectivity.app.ok ? "✓" : "✗"} ${connectivity.app.detail}`);
+
+    // A loopback success does not prove that the host firewall/provider allows
+    // remote traffic. Probe the exact browser URL from outside the SSH server.
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 12_000);
+      const publicResponse = await fetch(appUrl, { method: "HEAD", redirect: "manual", signal: controller.signal });
+      clearTimeout(timeout);
+      connectivity.public_app = {
+        ok: publicResponse.status >= 200 && publicResponse.status < 500,
+        detail: `HTTP ${publicResponse.status} sur ${appUrl}`,
+      };
+    } catch (publicError: any) {
+      connectivity.public_app = {
+        ok: false,
+        detail: `${appUrl} inaccessible depuis Internet (${publicError?.name === "AbortError" ? "délai dépassé" : "connexion refusée"})`,
+      };
+    }
+    await log(`  • Accès public : ${connectivity.public_app.ok ? "✓" : "⚠"} ${connectivity.public_app.detail}`);
+    if (connectivity.app.ok && !connectivity.public_app.ok) {
+      await log("⚠ Le conteneur fonctionne localement mais reste inaccessible à distance. Vérifiez aussi le pare-feu réseau/security group de l'hébergeur, que le serveur ne peut pas modifier lui-même.");
+    }
 
     if (installSupabase) {
       // REST

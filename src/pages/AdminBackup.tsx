@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import JSZip from "jszip";
 import { Textarea } from "@/components/ui/textarea";
+import { getSupabaseUrl } from "@/lib/env";
 
 const TABLES = [
   "profiles", "user_roles", "user_establishments", "establishments", "establishment_settings",
@@ -172,7 +173,7 @@ export default function AdminBackup() {
 
   // Deployment guide
   const [envType, setEnvType] = useState<"prod" | "staging">("prod");
-  const [envUrl, setEnvUrl] = useState(import.meta.env.VITE_SUPABASE_URL || "");
+  const [envUrl, setEnvUrl] = useState(getSupabaseUrl());
   const [envKey, setEnvKey] = useState(import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY || "");
   const [envProjectId, setEnvProjectId] = useState(import.meta.env.VITE_SUPABASE_PROJECT_ID || "");
   const [envPort, setEnvPort] = useState("8080");
@@ -739,7 +740,7 @@ To rebuild manually: docker compose up -d --build
     zip.file(
       "index.html",
       `<!doctype html><html><head><meta charset="utf-8"/><title>ScreenFlow</title></head><body>
-<script>window.location.href="${import.meta.env.VITE_SUPABASE_URL ? "https://" + window.location.hostname : "/"}";</script>
+<script>window.location.href="/";</script>
 </body></html>`,
     );
     const blob = await zip.generateAsync({ type: "blob" });

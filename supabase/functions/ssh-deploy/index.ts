@@ -168,10 +168,10 @@ async function startDetachedCompose(conn: Client, repoDir: string, stateDir: str
 }
 
 /**
- * Create a usable web compose file as soon as the repository is available.
- * The local backend can take several minutes to start; keeping this scaffold
- * early makes the deployment resumable and prevents repair actions from
- * finding a cloned repository without docker-compose.yml.
+ * Create a usable web compose scaffold as soon as the repository is available.
+ * Do not build here: the definitive nginx proxy and port configuration are
+ * written later. Starting two concurrent builds can leave the stale image
+ * running and race on the shared build status files.
  */
 async function prepareEarlyWebDeployment(
   conn: Client,
@@ -210,8 +210,7 @@ async function prepareEarlyWebDeployment(
     throw new Error(`Le dépôt ${repoDir} doit contenir Dockerfile et nginx.conf.`);
   }
   await log("✓ Déploiement web préparé tôt (reprise automatique possible)");
-  await startDetachedCompose(conn, repoDir, `${remoteDir}/.build`);
-  await log("✓ Build web lancé en arrière-plan pendant la préparation du backend");
+  await log("✓ Build différé jusqu'à l'écriture du proxy Auth/REST/Storage définitif");
 }
 
 async function patchRemoteBuildEntrypoint(conn: Client, repoDir: string, log: (m: string) => Promise<void> | void) {
@@ -2170,13 +2169,15 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
       }
 
       await log(earlyWebStarted
-        ? "→ Finalisation du build web déjà lancé en arrière-plan…"
+        ? "→ Reconstruction finale du web avec le proxy local définitif…"
         : "→ Build des conteneurs lancé en arrière-plan sur le serveur (docker compose up -d --build)…");
       const buildStateDir = `${remoteDir}/.build`;
-      if (!earlyWebStarted) {
-        await startDetachedCompose(conn, `${remoteDir}/repo`, buildStateDir);
-        await log("✓ Build détaché démarré — il continue même si cette session se termine.");
-      }
+      // The early build uses the repository's initial Dockerfile/nginx.conf. The
+      // definitive files (same-origin Auth/REST/Storage proxy and final ports)
+      // are only written above, so a second build is mandatory. Reusing the
+      // result of the early build left old nginx configuration running locally.
+      await startDetachedCompose(conn, `${remoteDir}/repo`, buildStateDir);
+      await log("✓ Build final détaché démarré — la configuration proxy définitive sera utilisée.");
       const buildDeadline = Math.min(deploymentDeadline, Date.now() + 4 * 60 * 1000);
       const buildResult = await pollDetachedCompose(conn, buildStateDir, buildDeadline, log);
       if (!buildResult.done) {
@@ -2233,6 +2234,25 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
       await log(`  • Supabase Auth    : ${connectivity.auth.ok ? "✓" : "✗"} ${connectivity.auth.detail}`);
       await log(`  • Supabase Storage : ${connectivity.storage.ok ? "✓" : "✗"} ${connectivity.storage.detail}`);
       await log(`  • Postgres         : ${connectivity.postgres.ok ? "✓" : "✗"} ${connectivity.postgres.detail}`);
+
+      // A healthy Kong is not enough: browsers only use the web container's
+      // same-origin proxy. Validate that exact route before declaring success.
+      const proxyBase = enableHttps ? `https://127.0.0.1:${httpsPort}` : `http://127.0.0.1:${appPort}`;
+      const proxyRest = await exec(conn, `curl -k -sS -m 10 -o /dev/null -w "%{http_code}" ${shQuote(`${proxyBase}/rest/v1/`)} -H ${shQuote(`apikey: ${supabaseAnonOverride}`)} -H ${shQuote(`Authorization: Bearer ${supabaseAnonOverride}`)} 2>/dev/null || true`);
+      const proxyAuth = await exec(conn, `curl -k -sS -m 10 -o /dev/null -w "%{http_code}" ${shQuote(`${proxyBase}/auth/v1/health`)} -H ${shQuote(`apikey: ${supabaseAnonOverride}`)} 2>/dev/null || true`);
+      const proxyStorage = await exec(conn, `curl -k -sS -m 10 -o /dev/null -w "%{http_code}" ${shQuote(`${proxyBase}/storage/v1/bucket`)} -H ${shQuote(`apikey: ${supabaseAnonOverride}`)} -H ${shQuote(`Authorization: Bearer ${supabaseAnonOverride}`)} 2>/dev/null || true`);
+      const proxyRestCode = (proxyRest.stdout || "").trim();
+      const proxyAuthCode = (proxyAuth.stdout || "").trim();
+      const proxyStorageCode = (proxyStorage.stdout || "").trim();
+      connectivity.web_proxy = {
+        ok: /^(2\d\d|401|403|404)$/.test(proxyRestCode) && /^2\d\d$/.test(proxyAuthCode) && /^(2\d\d|401|403|404)$/.test(proxyStorageCode),
+        detail: `REST ${proxyRestCode || "000"}, Auth ${proxyAuthCode || "000"}, Storage ${proxyStorageCode || "000"} via ${proxyBase}`,
+      };
+      await log(`  • Proxy web local : ${connectivity.web_proxy.ok ? "✓" : "✗"} ${connectivity.web_proxy.detail}`);
+      if (!connectivity.web_proxy.ok) {
+        const webLogs = await exec(conn, `cd ${remoteDir}/repo && docker compose logs --tail=100 web 2>&1 || true`);
+        throw new Error(`Le backend direct répond, mais le proxy web utilisé par le navigateur est invalide (${connectivity.web_proxy.detail}). ${(`${webLogs.stdout}${webLogs.stderr}`).slice(-1800)}`);
+      }
     }
 
     if (installPostgresOnly) {
@@ -2260,16 +2280,17 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
           // Confirme explicitement Auth + Storage via l'IP locale
           await log(`→ Confirmation finale Auth/Storage via ${supabaseUrlOverride || appUrl}…`);
           try {
+            const loginProxyBase = enableHttps ? `https://127.0.0.1:${httpsPort}` : `http://127.0.0.1:${appPort}`;
             await verifyAuthLoginFromServer(
               conn,
-              `http://127.0.0.1:${supaKongPort}`,
+              loginProxyBase,
               supabaseAnonOverride,
               DEFAULT_ADMIN_EMAIL,
               DEFAULT_ADMIN_PASSWORD,
               log,
               buildDirectKongAuthLoginCommand(supaDir, supabaseAnonOverride, DEFAULT_ADMIN_EMAIL, DEFAULT_ADMIN_PASSWORD),
             );
-            connectivity.auth_login = { ok: true, detail: `Login admin OK via http://127.0.0.1:${supaKongPort}` };
+            connectivity.auth_login = { ok: true, detail: `Login admin OK via le proxy web ${loginProxyBase}` };
           } catch (authErr: any) {
             connectivity.auth_login = { ok: false, detail: (authErr?.message || String(authErr)).slice(0, 300) };
             await log("⚠ Confirmation Auth échouée : " + connectivity.auth_login.detail);
@@ -3505,14 +3526,19 @@ async function runNetworkInspect(body: DeployBody, log: (m: string) => Promise<v
       return { container: name, ports: p };
     });
 
-    await log("→ Tests de connectivité interne (web → kong/db)…");
-    const webName = (await exec(conn, `cd ${remoteDir} && (docker compose ps -q web || docker-compose ps -q web) 2>/dev/null | head -1`)).stdout.trim();
+    await log("→ Tests du trajet réel navigateur → web → gateway locale…");
+    const kongPort = await readRemoteEnv(conn, `${supaDir}/.env`, "KONG_HTTP_PORT") || "8000";
+    const anonKey = await readRemoteEnv(conn, `${supaDir}/.env`, "ANON_KEY")
+      || await readRemoteEnv(conn, `${supaDir}/.env`, "SUPABASE_PUBLISHABLE_KEY");
+    const webName = (await exec(conn, `cd ${remoteDir}/repo && (docker compose ps -q web || docker-compose ps -q web) 2>/dev/null | head -1`)).stdout.trim();
     const tests: any[] = [];
     if (webName) {
-      const t1 = await exec(conn, `docker exec ${webName} sh -lc 'wget -q -T 3 -O - http://kong:8000/ 2>&1 | head -c 80' 2>&1`);
-      tests.push({ from: "web", to: "kong:8000", ok: (t1.code === 0), output: (t1.stdout || "").trim() || (t1.stderr || "").trim() });
-      const t2 = await exec(conn, `docker exec ${webName} sh -lc 'getent hosts db || nslookup db' 2>&1`);
-      tests.push({ from: "web", to: "db (DNS)", ok: t2.code === 0, output: (t2.stdout || "").trim().split("\n")[0] || "" });
+      const gatewayProbe = await exec(conn, `docker exec ${webName} sh -lc ${shQuote(`wget -q -T 5 -S -O /dev/null --header=${shQuote(`apikey: ${anonKey}`)} http://host.docker.internal:${kongPort}/rest/v1/ 2>&1`)} 2>&1`);
+      tests.push({ from: "web", to: `host.docker.internal:${kongPort}/rest/v1`, ok: gatewayProbe.code === 0, output: `${gatewayProbe.stdout}${gatewayProbe.stderr}`.trim().slice(-300) });
+      const appPort = body.app_port || "8080";
+      const proxyProbe = await exec(conn, `curl -sS -m 5 -o /dev/null -w "%{http_code}" http://127.0.0.1:${appPort}/rest/v1/ -H ${shQuote(`apikey: ${anonKey}`)} -H ${shQuote(`Authorization: Bearer ${anonKey}`)} 2>/dev/null || true`);
+      const proxyCode = (proxyProbe.stdout || "").trim();
+      tests.push({ from: "host", to: `web:${appPort}/rest/v1`, ok: /^(2\d\d|401|403|404)$/.test(proxyCode), output: `HTTP ${proxyCode || "000"}` });
     }
 
     await log("✓ Inspection terminée");

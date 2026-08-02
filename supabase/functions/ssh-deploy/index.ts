@@ -158,7 +158,7 @@ async function startDetachedCompose(conn: Client, repoDir: string, stateDir: str
     `'cd ${repoDir} || exit 1' ` +
     `'if docker compose version >/dev/null 2>&1; then COMPOSE=(docker compose); elif command -v docker-compose >/dev/null 2>&1; then COMPOSE=(docker-compose); else echo "Docker Compose est introuvable" > ${stateDir}/build.log; echo 127 > ${stateDir}/build.code; exit 127; fi' ` +
     `'"\${COMPOSE[@]}" up -d --build > ${stateDir}/build.log 2>&1' ` +
-    `'echo $? > ${stateDir}/build.code' > ${script} && ` +
+    `'code=$?; echo $code > ${stateDir}/build.code; rm -rf ${stateDir}/build.lock; exit $code' > ${script} && ` +
     `chmod +x ${script} && rm -f ${stateDir}/build.code && : > ${stateDir}/build.log && ` +
     `(setsid nohup ${script} >/dev/null 2>&1 & ) && echo STARTED`;
   const res = await exec(conn, cmd);
@@ -188,6 +188,7 @@ async function prepareEarlyWebDeployment(
   const quoteYaml = (value: string) => `'${(value || "").replace(/'/g, "''")}'`;
   const compose = `services:
   web:
+    container_name: screenflow-web
     build:
       context: .
       args:
@@ -1561,7 +1562,14 @@ async function runDeploymentJob(
       await runDeployment(body, log);
     }
     const result = directResult ?? (globalThis as any).__lastDeployResult ?? null;
-    await persist({ status: "success", logs, result });
+    const resultFailed = !!result && typeof result === "object" && "ok" in result && result.ok === false;
+    if (resultFailed) {
+      const error = String(result.cause || "L'opération n'a pas confirmé son succès.");
+      logs.push("✗ ERROR: " + error);
+      await persist({ status: "error", logs, result, error });
+    } else {
+      await persist({ status: "success", logs, result });
+    }
   } catch (e: any) {
     const detail = `${e?.message || String(e)}${e?.stack ? ` | ${String(e.stack).split("\n").slice(0, 4).join(" ⏎ ")}` : ""}`;
     logs.push("✗ ERROR: " + detail);
@@ -3007,12 +3015,16 @@ async function runDiagnoseServer(
     const supaPresent = (supaCheck.stdout || "").includes("OK");
     add({ key: "supabase_stack", label: "Stack Supabase locale", ok: supaPresent, suggested_action: supaPresent ? undefined : "redeploy" });
 
-    // Containers running
+    // Containers running. The application compose project is commonly named
+    // "repo", so its default container is repo-web-1 (not screenflow-web).
+    // Resolve the compose service ID first instead of guessing from its name.
     const ps = await exec(conn, `docker ps --format '{{.Names}}|{{.Status}}' 2>&1 || true`);
     const psLines = (ps.stdout || "").split("\n").filter(Boolean);
     const has = (re: RegExp) => psLines.some((l) => re.test(l));
-    const webOk = has(/screenflow.*web|screenflow-web|^web\|/i) || has(/nginx/i);
-    add({ key: "container_web", label: "Conteneur web (frontend)", ok: webOk, suggested_action: webOk ? undefined : "repair_web_container" });
+    const webComposeState = await exec(conn, `if [ -f ${remoteDir}/repo/docker-compose.yml ]; then cd ${remoteDir}/repo && CID=$(docker compose ps -q web 2>/dev/null || docker-compose ps -q web 2>/dev/null || true); if [ -n "$CID" ]; then docker inspect -f '{{.State.Running}}|{{.Name}}' "$CID" 2>/dev/null; fi; fi`);
+    const webOk = /^true\|/m.test(webComposeState.stdout || "") || has(/screenflow.*web|screenflow-web|repo-web-[0-9]+|^web\|/i);
+    const webDetail = (webComposeState.stdout || "").trim().replace(/^true\|\/?/, "") || undefined;
+    add({ key: "container_web", label: "Conteneur web (frontend)", ok: webOk, detail: webDetail, suggested_action: webOk ? undefined : "repair_web_container" });
 
     if (supaPresent) {
       const dbOk = has(/supabase-db|^db\|/i);
@@ -3194,19 +3206,51 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
   await log("✓ SSH connecté");
   const result: any = { action: "repair_web_container", ok: false, cause: null, running: false, upload_proxy_ok: false };
   try {
-    const present = (await exec(conn, `[ -f ${repoDir}/docker-compose.yml ] && echo OK || echo NO`)).stdout.includes("OK");
-    if (!present) {
-      result.cause = `Aucun docker-compose.yml dans ${repoDir}`;
-      throw new Error(`Aucun docker-compose.yml applicatif dans ${repoDir}. Lancez un déploiement complet.`);
-    }
-
-
     // Normalize old remote checkouts before rebuilding. A repair can target a
     // repository deployed by an earlier function version, so it must not rely
     // on the full deployment path having already applied these compatibility fixes.
     await log("→ Normalisation de la configuration de build distante…");
     await patchRemoteBuildEntrypoint(conn, repoDir, log);
     await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
+
+    // Recreate a deterministic one-service compose file. Older deployments use
+    // the implicit project name "repo" (repo-web-1), which made diagnostics and
+    // subsequent repairs target different containers. A fixed container name
+    // also prevents orphaned web containers from keeping the HTTP port busy.
+    const appPort = body.app_port || "8080";
+    const kongPort = await readRemoteEnv(conn, `${supaDir}/.env`, "KONG_HTTP_PORT") || body.supabase_kong_http_port || "8000";
+    const anonKey = await readRemoteEnv(conn, `${supaDir}/.env`, "ANON_KEY")
+      || await readRemoteEnv(conn, `${supaDir}/.env`, "SUPABASE_PUBLISHABLE_KEY")
+      || body.vite_supabase_key || "";
+    const projectId = body.vite_supabase_project_id || "local";
+    const publicBase = resolveBrowserAppBase(body, appPort, false);
+    const quoteYaml = (value: string) => `'${(value || "").replace(/'/g, "''")}'`;
+    const compose = `services:
+  web:
+    container_name: screenflow-web
+    build:
+      context: .
+      args:
+        VITE_SUPABASE_URL: '__SCREENFLOW_SAME_ORIGIN__'
+        VITE_SUPABASE_PUBLISHABLE_KEY: ${quoteYaml(anonKey)}
+        VITE_SUPABASE_PROJECT_ID: ${quoteYaml(projectId)}
+        VITE_PUBLIC_APP_URL: ${quoteYaml(publicBase)}
+        VITE_APP_BASE_PATH: '/'
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${appPort}:80"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+`;
+    await uploadFile(conn, `${repoDir}/docker-compose.yml`, Buffer.from(compose));
+    await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(buildUploadRepairNginxConf(kongPort)));
+    await log(`✓ Configuration web canonique recréée (conteneur screenflow-web, port ${appPort}, Kong ${kongPort})`);
     const composeConfig = await exec(conn, `cd ${repoDir} && (docker compose config --quiet || docker-compose config --quiet) 2>&1`);
     if (composeConfig.code !== 0) {
       const detail = `${composeConfig.stdout || ""}${composeConfig.stderr || ""}`.trim().slice(-4000);
@@ -3227,10 +3271,24 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
     if ((webLogs.stdout || "").trim()) await log("ℹ Logs conteneur web :\n" + webLogs.stdout.slice(-1200));
     if (!result.cause && !/Up\s/i.test(state.stdout)) result.cause = "Conteneur web arrêté ou jamais construit";
 
-    // 2. Rebuild (detached so the edge runtime timeout cannot kill it)
-    await log("→ Reconstruction du conteneur web en arrière-plan (docker compose up -d --build)…");
+    // 2. Rebuild (detached so the edge runtime timeout cannot kill it). Use an
+    // atomic directory lock so a double click cannot remove a container while
+    // another repair is still building it.
     const stateDir = `${remoteDir}/.build`;
-    await startDetachedCompose(conn, repoDir, stateDir);
+    const lock = await exec(conn, `mkdir -p ${stateDir}; if mkdir ${stateDir}/build.lock 2>/dev/null; then echo LOCKED; elif [ -f ${stateDir}/build.code ]; then rm -rf ${stateDir}/build.lock && mkdir ${stateDir}/build.lock && echo LOCKED; else echo BUSY; fi`);
+    if (!(lock.stdout || "").includes("LOCKED")) {
+      result.cause = "Une reconstruction web est déjà en cours. Utilisez « Vérifier le build » avant de relancer une réparation.";
+      throw new Error(result.cause);
+    }
+    await log("→ Suppression des anciens conteneurs web/orphelins…");
+    await exec(conn, `cd ${repoDir} && (docker compose down --remove-orphans 2>&1 || docker-compose down --remove-orphans 2>&1 || true); docker rm -f screenflow-web 2>/dev/null || true`);
+    await log("→ Reconstruction du conteneur web en arrière-plan (docker compose up -d --build)…");
+    try {
+      await startDetachedCompose(conn, repoDir, stateDir);
+    } catch (error) {
+      await exec(conn, `rm -rf ${stateDir}/build.lock`);
+      throw error;
+    }
     const res = await pollDetachedCompose(conn, stateDir, Date.now() + 4 * 60 * 1000, log);
     if (!res.done) {
       await log("⏳ Build toujours en cours — cliquez sur « Vérifier le build » dans quelques minutes.");
@@ -3257,10 +3315,13 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
 
     // 3. Verify container up + nginx proxy for uploads
     const ps2 = await exec(conn, `cd ${repoDir} && (docker compose ps || docker-compose ps) 2>&1`);
-    result.running = /Up\s|running/i.test(ps2.stdout);
     await log((ps2.stdout || "").split("\n").slice(-10).join("\n"));
 
     const cid = (await exec(conn, `cd ${repoDir} && (docker compose ps -q web || docker-compose ps -q web) 2>/dev/null | head -1`)).stdout.trim();
+    const inspect = cid ? await exec(conn, `docker inspect -f '{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{.State.ExitCode}}|{{.State.Error}}' ${cid} 2>/dev/null || true`) : { stdout: "", stderr: "", code: 1 };
+    result.running = /^true\|/i.test((inspect.stdout || "").trim());
+    result.container_state = (inspect.stdout || "").trim();
+    await log(`  • État Docker : ${result.container_state || "conteneur introuvable"}`);
     if (cid) {
       const conf = await exec(conn, `docker exec ${cid} cat /etc/nginx/conf.d/default.conf 2>/dev/null || true`);
       const hasStorage = /location \/storage\/v1\//.test(conf.stdout);
@@ -3274,8 +3335,19 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
       await log(result.host_gateway_ok
         ? `✓ host.docker.internal résolu (${(gw.stdout || "").trim().split(/\s+/)[0]})`
         : "✗ host.docker.internal non résolu dans le conteneur web — le proxy vers Kong/Storage ne peut pas fonctionner.");
-      const up = await exec(conn, `docker exec ${cid} sh -c 'wget -q -S -O /dev/null http://host.docker.internal:8000/storage/v1/bucket 2>&1 | head -3' || true`);
+      const up = await exec(conn, `docker exec ${cid} sh -c 'wget -q -S -O /dev/null http://host.docker.internal:${kongPort}/storage/v1/bucket 2>&1 | head -3' || true`);
       if ((up.stdout || "").trim()) await log("ℹ Test Storage depuis le conteneur web : " + (up.stdout || "").trim().replace(/\s+/g, " ").slice(0, 200));
+    }
+
+    // A running container is not enough: verify the exact HTTP route used by
+    // local browsers and fail with actionable container logs when it is blank.
+    const http = await exec(conn, `for i in $(seq 1 12); do code=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:${appPort}/ 2>/dev/null || true); [ "$code" = 200 ] && { echo 200; exit 0; }; sleep 2; done; echo "${'$'}{code:-000}"`);
+    result.app_http = (http.stdout || "").trim().split("\n").pop() || "000";
+    await log(`  • Application HTTP : ${result.app_http} sur 127.0.0.1:${appPort}`);
+    if (!result.running || result.app_http !== "200") {
+      const failureLogs = await exec(conn, `cd ${repoDir} && (docker compose logs --tail=120 web || docker-compose logs --tail=120 web) 2>&1 || true`);
+      result.cause = `Le conteneur web ne sert pas l'application (Docker ${result.container_state || "absent"}, HTTP ${result.app_http}). ${(failureLogs.stdout || failureLogs.stderr || "").slice(-2500)}`;
+      throw new Error(result.cause);
     }
 
     // 4. Make sure storage service + policies/buckets are healthy (uploads)
@@ -3286,7 +3358,7 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
       await applyLocalDashboardWriteHotfix(conn, supaDir, log);
     }
 
-    result.ok = result.running;
+    result.ok = result.running && result.app_http === "200";
     await log(result.ok
       ? "✓ Conteneur web reconstruit et démarré. Rechargez l'application puis retestez un upload."
       : "⚠ Le conteneur web ne tourne toujours pas — consultez les logs ci-dessus.");

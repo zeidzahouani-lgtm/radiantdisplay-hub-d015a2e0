@@ -1503,12 +1503,29 @@ END $$;
 async function ensureDefaultAdminRole(conn: Client, supaDir: string, log: (m: string) => Promise<void> | void) {
   const roleSql = `
 DO $$
-DECLARE uid uuid;
+DECLARE
+  uid uuid;
+  est record;
+  code text;
 BEGIN
   SELECT id INTO uid FROM auth.users WHERE lower(email)=lower('${DEFAULT_ADMIN_EMAIL}') LIMIT 1;
   IF uid IS NULL THEN
     RAISE EXCEPTION 'Compte Auth introuvable pour ${DEFAULT_ADMIN_EMAIL}';
   END IF;
+
+  -- Compte Auth pleinement actif (confirmé, non banni)
+  UPDATE auth.users SET
+    email_confirmed_at = COALESCE(email_confirmed_at, now()),
+    banned_until = NULL,
+    deleted_at = NULL,
+    role = 'authenticated',
+    aud = 'authenticated',
+    raw_app_meta_data = COALESCE(raw_app_meta_data, '{}'::jsonb)
+      || '{"provider":"email","providers":["email"],"role":"admin","super_admin":true}'::jsonb,
+    raw_user_meta_data = COALESCE(raw_user_meta_data, '{}'::jsonb)
+      || '{"display_name":"ScreenFlow Admin","role":"admin"}'::jsonb,
+    updated_at = now()
+  WHERE id = uid;
 
   IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='profiles') THEN
     INSERT INTO public.profiles (id, email, display_name)
@@ -1516,17 +1533,59 @@ BEGIN
     ON CONFLICT (id) DO UPDATE SET email=EXCLUDED.email, display_name=EXCLUDED.display_name, updated_at=now();
   END IF;
 
+  -- Rôles globaux : admin (super admin) + marketing si l'enum le prévoit
   IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='user_roles') THEN
     INSERT INTO public.user_roles (user_id, role) VALUES (uid, 'admin') ON CONFLICT DO NOTHING;
+    IF EXISTS (
+      SELECT 1 FROM pg_type t JOIN pg_enum e ON e.enumtypid = t.oid
+      WHERE t.typname = 'app_role' AND e.enumlabel = 'marketing'
+    ) THEN
+      INSERT INTO public.user_roles (user_id, role) VALUES (uid, 'marketing') ON CONFLICT DO NOTHING;
+    END IF;
     DELETE FROM public.user_roles WHERE user_id=uid AND role='user';
+  END IF;
+
+  -- Accès admin sur TOUS les établissements existants (multi-tenant)
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='user_establishments') THEN
+    FOR est IN SELECT id FROM public.establishments LOOP
+      IF EXISTS (SELECT 1 FROM public.user_establishments WHERE user_id=uid AND establishment_id=est.id) THEN
+        UPDATE public.user_establishments SET role='admin' WHERE user_id=uid AND establishment_id=est.id;
+      ELSE
+        INSERT INTO public.user_establishments (user_id, establishment_id, role) VALUES (uid, est.id, 'admin');
+      END IF;
+    END LOOP;
+  END IF;
+
+  -- Code d'accès actif (upload QR / support)
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='access_codes') THEN
+    IF EXISTS (SELECT 1 FROM public.access_codes WHERE user_id=uid) THEN
+      UPDATE public.access_codes SET is_active=true WHERE user_id=uid;
+    ELSE
+      code := 'SCR-' || upper(substr(md5(random()::text), 1, 5));
+      INSERT INTO public.access_codes (code, user_name, user_id, is_active)
+      VALUES (code, 'ScreenFlow Admin', uid, true);
+    END IF;
   END IF;
 END $$;
 `.trim();
   const roleB64 = btoa(roleSql);
   const promoted = await exec(conn, dockerPsql(supaDir, roleB64));
   if (promoted.code !== 0) throw new Error("Compte Auth créé, mais attribution du rôle admin échouée : " + (promoted.stdout + promoted.stderr).slice(-800));
-  await log("✓ Rôle admin global confirmé pour screenflow@screenflow.local");
+
+  // Vérification stricte des droits obtenus
+  const verify = await exec(conn, dockerPsqlSelect(supaDir,
+    `select coalesce(string_agg(distinct r.role::text, ','), 'AUCUN') || '|' ||
+            (select count(*)::text from public.user_establishments ue join auth.users u2 on u2.id=ue.user_id where lower(u2.email)=lower('${DEFAULT_ADMIN_EMAIL}') and ue.role='admin')
+     from public.user_roles r join auth.users u on u.id=r.user_id
+     where lower(u.email)=lower('${DEFAULT_ADMIN_EMAIL}')`));
+  const parsed = (verify.stdout || "").split("\n").map((l) => l.trim()).find((l) => l.includes("|")) || "";
+  const [roles, estCount] = parsed.split("|");
+  if (!roles || !roles.includes("admin")) {
+    throw new Error("Le rôle admin global n'a pas pu être vérifié après réparation. Sortie : " + (verify.stdout + verify.stderr).slice(-600));
+  }
+  await log(`✓ Droits super admin confirmés pour ${DEFAULT_ADMIN_EMAIL} — rôles globaux : ${roles} ; établissements en admin : ${estCount || 0}`);
 }
+
 
 // Background job runner: persists progress to public.app_settings under key ssh_deploy_job:<jobId>
 async function runDeploymentJob(

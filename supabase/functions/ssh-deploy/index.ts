@@ -203,6 +203,7 @@ async function prepareEarlyWebDeployment(
     restart: unless-stopped
 `;
   await uploadFile(conn, `${repoDir}/docker-compose.yml`, Buffer.from(compose));
+  await patchRemoteBuildEntrypoint(conn, repoDir, log);
   await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
   const required = await exec(conn, `[ -f ${repoDir}/Dockerfile ] && [ -f ${repoDir}/nginx.conf ] && echo OK || echo NO`);
   if (!(required.stdout || "").includes("OK")) {
@@ -211,6 +212,34 @@ async function prepareEarlyWebDeployment(
   await log("✓ Déploiement web préparé tôt (reprise automatique possible)");
   await startDetachedCompose(conn, repoDir, `${remoteDir}/.build`);
   await log("✓ Build web lancé en arrière-plan pendant la préparation du backend");
+}
+
+async function patchRemoteBuildEntrypoint(conn: Client, repoDir: string, log: (m: string) => Promise<void> | void) {
+  const patch = `python3 - <<'PY'
+from pathlib import Path
+import json
+
+repo = Path(${JSON.stringify(repoDir)})
+dockerfile = repo / 'Dockerfile'
+package_json = repo / 'package.json'
+
+if not dockerfile.is_file() or not package_json.is_file():
+    raise SystemExit('Dockerfile ou package.json absent du dépôt distant')
+
+s = dockerfile.read_text()
+s = s.replace('RUN npm run build:local', 'RUN npm run build -- --mode selfhosted')
+dockerfile.write_text(s)
+
+data = json.loads(package_json.read_text())
+data.setdefault('scripts', {})['build:local'] = 'vite build --mode selfhosted'
+package_json.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\\n')
+print('OK')
+PY`;
+  const result = await exec(conn, patch);
+  if (result.code !== 0 || !(result.stdout || "").includes("OK")) {
+    throw new Error("Impossible de fiabiliser la commande de build distante: " + (result.stderr || result.stdout).slice(-500));
+  }
+  await log("✓ Commande de build distante normalisée (mode Vite selfhosted)");
 }
 
 async function pollDetachedCompose(
@@ -2159,8 +2188,17 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
       }
       await log(buildResult.tail.slice(-2000));
       if (buildResult.code !== 0) {
-        const buildDetail = buildResult.tail
-          ? " — " + buildResult.tail.split("\n").slice(-6).join(" | ").slice(-1200)
+        const diagnostic = await exec(
+          conn,
+          `LOG=${buildStateDir}/build.log; ` +
+          `echo '--- erreurs utiles ---'; ` +
+          `(grep -nEi 'error|failed|cannot find|could not resolve|typeerror|syntaxerror|npm ERR' "$LOG" | tail -40 || true); ` +
+          `echo '--- fin du journal ---'; tail -n 100 "$LOG" 2>/dev/null`,
+        );
+        const usefulLog = (diagnostic.stdout || buildResult.tail || "").trim();
+        await log(usefulLog.slice(-8000));
+        const buildDetail = usefulLog
+          ? " — " + usefulLog.split("\n").slice(-24).join(" | ").slice(-5000)
           : "";
         throw new Error("docker compose failed (code " + buildResult.code + ")" + buildDetail + " — voir " + buildStateDir + "/build.log sur le serveur");
       }

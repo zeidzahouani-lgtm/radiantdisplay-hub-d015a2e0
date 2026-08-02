@@ -6,6 +6,15 @@ const Client: any = ssh2Mod.Client ?? ssh2Mod.default?.Client;
 type Client = any;
 import { Buffer } from "node:buffer";
 
+// Base64 encoding of the UTF-8 bytes (btoa() alone corrupts accented chars -> invalid UTF8 in psql)
+function b64utf8(input: string): string {
+  const bytes = new TextEncoder().encode(input);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
@@ -485,13 +494,13 @@ function dockerPsql(connDir: string, sqlB64: string, onErrorStop = true) {
 }
 
 function dockerPsqlSelect(connDir: string, sql: string, silent = true) {
-  const sqlB64 = btoa(sql);
+  const sqlB64 = b64utf8(sql);
   const psql = `PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U postgres -d postgres -At -c "$(printf '%s' '${sqlB64}' | base64 -d)"`;
   return `cd ${connDir} && docker compose exec -T --user postgres db sh -lc ${shQuote(psql)}${silent ? " 2>/dev/null || true" : " 2>&1"}`;
 }
 
 function dockerPsqlExec(connDir: string, sql: string) {
-  return dockerPsql(connDir, btoa(sql), true);
+  return dockerPsql(connDir, b64utf8(sql), true);
 }
 
 interface RemotePreflightResult {
@@ -635,8 +644,8 @@ async function checkRemotePortsAvailable(
   if (requiredPorts.length === 0) return;
 
   await log(`→ Vérification des ports locaux requis: ${requiredPorts.map((p) => `${p.label}:${p.value}`).join(", ")}…`);
-  const payload = btoa(JSON.stringify(requiredPorts));
-  const ignoredPayload = btoa(JSON.stringify(ignoredComposeDirs));
+  const payload = b64utf8(JSON.stringify(requiredPorts));
+  const ignoredPayload = b64utf8(JSON.stringify(ignoredComposeDirs));
   const script = `PORTS_B64=${shQuote(payload)} IGNORE_DIRS_B64=${shQuote(ignoredPayload)} python3 - <<'PY'
 import base64, json, socket
 import os, subprocess
@@ -852,7 +861,7 @@ out = "${sentinel}\\n" + yaml.safe_dump(data, sort_keys=False, default_flow_styl
 p.write_text(out)
 print("OK changed=%d" % changed)
 `;
-  const enc = btoa(unescape(encodeURIComponent(py)));
+  const enc = b64utf8(py);
   const run = await exec(conn, `echo '${enc}' | base64 -d | python3 - 2>&1`);
   await log((`${run.stdout}${run.stderr}`).slice(-600));
 
@@ -904,7 +913,7 @@ for line in lines:
 p.write_text("\\n".join(out) + "\\n")
 print(f"OK removed={removed}")
 `;
-  const enc = btoa(unescape(encodeURIComponent(py)));
+  const enc = b64utf8(py);
   const run = await exec(conn, `echo '${enc}' | base64 -d | python3 - 2>&1`);
   await log((`${run.stdout}${run.stderr}`).slice(-600));
   await exec(conn, `cd ${supaDir} && docker compose rm -sf kong 2>&1 || true`);
@@ -1176,7 +1185,7 @@ CREATE POLICY "Public can read media files" ON storage.objects
 FOR SELECT TO anon, authenticated
 USING (bucket_id IN ('media','uploads'));
 `;
-  const result = await exec(conn, dockerPsql(supaDir, btoa(sql), false));
+  const result = await exec(conn, dockerPsql(supaDir, b64utf8(sql), false));
   const output = `${result.stdout}${result.stderr}`;
   if (result.code !== 0 || /ERROR:/i.test(output)) {
     await log("⚠ Correction permissions incomplète: " + output.slice(-1600));
@@ -1194,7 +1203,7 @@ async function verifyAuthLoginFromServer(
   log: (m: string) => Promise<void> | void,
   fallbackCommand?: string,
 ) {
-  const payloadB64 = btoa(JSON.stringify({ email, password }));
+  const payloadB64 = b64utf8(JSON.stringify({ email, password }));
   const command =
     `AUTH_URL=${shQuote(`${authBaseUrl.replace(/\/$/, "")}/auth/v1/token?grant_type=password`)} ` +
     `ANON_KEY=${shQuote(anonKey)} BODY_B64=${shQuote(payloadB64)} sh -c ` +
@@ -1269,14 +1278,14 @@ async function ensurePostgresSqlAccess(conn: Client, supaDir: string, log: (m: s
 }
 
 function buildAuthLoginCurlCommand(authBaseUrl: string, anonKey: string, email: string, password: string) {
-  const payloadB64 = btoa(JSON.stringify({ email, password }));
+  const payloadB64 = b64utf8(JSON.stringify({ email, password }));
   return `AUTH_URL=${shQuote(`${authBaseUrl.replace(/\/$/, "")}/auth/v1/token?grant_type=password`)} ` +
     `ANON_KEY=${shQuote(anonKey)} BODY_B64=${shQuote(payloadB64)} sh -c ` +
     shQuote(`body=$(printf "%s" "$BODY_B64" | base64 -d); curl -k -sS -m 20 -w "\\nHTTP_STATUS:%{http_code}" -X POST "$AUTH_URL" -H "apikey: $ANON_KEY" -H "Authorization: Bearer $ANON_KEY" -H "Content-Type: application/json" --data "$body"`);
 }
 
 function buildDirectKongAuthLoginCommand(supaDir: string, anonKey: string, email: string, password: string) {
-  const payloadB64 = btoa(JSON.stringify({ email, password }));
+  const payloadB64 = b64utf8(JSON.stringify({ email, password }));
   return `cd ${supaDir} && KONG_CID=$(docker compose ps -q kong) && ` +
     `KONG_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$KONG_CID" | awk '{print $1}') && ` +
     `AUTH_URL="http://$KONG_IP:8000/auth/v1/token?grant_type=password" ` +
@@ -1321,7 +1330,7 @@ async function syncLocalAuthSafeEnv(conn: Client, supaDir: string, log: (m: stri
     "HOOK_PASSWORD_VERIFICATION_ATTEMPT_ENABLED=false",
   ].join("\n") + "\n";
   const keys = envPatch.split("\n").map((line) => line.split("=")[0]).filter(Boolean).join(" ");
-  const b64 = btoa(envPatch);
+  const b64 = b64utf8(envPatch);
   const cmd = `cd ${supaDir} && for k in ${keys}; do sed -i "/^$k=/d" .env; done && printf '%s' '${b64}' | base64 -d >> .env && docker compose rm -sf auth 2>&1 || true`;
   await exec(conn, cmd);
   await log("✓ Configuration Auth locale sécurisée (hooks réseau désactivés)");
@@ -1398,16 +1407,16 @@ async function upsertDefaultAdminViaAuthApi(
   const body = existingId
     ? { email: DEFAULT_ADMIN_EMAIL, password, email_confirm: true, user_metadata: { display_name: "ScreenFlow Admin" }, app_metadata: { provider: "email", providers: ["email"] }, ban_duration: "none" }
     : { email: DEFAULT_ADMIN_EMAIL, password, email_confirm: true, user_metadata: { display_name: "ScreenFlow Admin" }, app_metadata: { provider: "email", providers: ["email"] } };
-  const payloadB64 = btoa(JSON.stringify(body));
+  const payloadB64 = b64utf8(JSON.stringify(body));
   const method = existingId ? "PUT" : "POST";
   const path = existingId ? `/auth/v1/admin/users/${existingId}` : "/auth/v1/admin/users";
-  const serviceKeyB64 = btoa(serviceKey);
+  const serviceKeyB64 = b64utf8(serviceKey);
 
   // Exécution directe via bash -c : on décode en variables locales, puis curl.
   // Évite tout problème avec `sh` absent du PATH ou des quotes mal échappées.
   const call = (baseUrl: string) => {
-    const baseB64 = btoa(baseUrl.replace(/\/$/, ""));
-    const pathB64 = btoa(path);
+    const baseB64 = b64utf8(baseUrl.replace(/\/$/, ""));
+    const pathB64 = b64utf8(path);
     const script =
       `set -e; ` +
       `API_BASE=$(printf '%s' '${baseB64}' | base64 -d); ` +
@@ -1492,7 +1501,7 @@ BEGIN
   END IF;
 END $$;
 `.trim();
-  const b64 = btoa(sql);
+  const b64 = b64utf8(sql);
   const res = await exec(conn, dockerPsql(supaDir, b64));
   if (res.code !== 0) {
     throw new Error("Échec du fallback SQL pour le compte admin : " + (res.stdout + res.stderr).slice(-800));
@@ -1568,7 +1577,7 @@ BEGIN
   END IF;
 END $$;
 `.trim();
-  const roleB64 = btoa(roleSql);
+  const roleB64 = b64utf8(roleSql);
   const promoted = await exec(conn, dockerPsql(supaDir, roleB64));
   if (promoted.code !== 0) throw new Error("Compte Auth créé, mais attribution du rôle admin échouée : " + (promoted.stdout + promoted.stderr).slice(-800));
 
@@ -2023,7 +2032,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
           `ENABLE_ANONYMOUS_USERS=false`,
           `DISABLE_SIGNUP=false`,
         ].join("\n") + "\n" + buildLocalAuthUrlEnvPatch(body, appPort, supaBrowserUrl, enableHttps, httpsDomain, httpsPort);
-        const envB64 = btoa(envPatch);
+        const envB64 = b64utf8(envPatch);
         await exec(conn, `cd ${supaDir} && for k in POSTGRES_PASSWORD JWT_SECRET ANON_KEY SERVICE_ROLE_KEY SUPABASE_PUBLISHABLE_KEY SUPABASE_SECRET_KEY DASHBOARD_USERNAME DASHBOARD_PASSWORD SITE_URL API_EXTERNAL_URL GOTRUE_EXTERNAL_URL ADDITIONAL_REDIRECT_URLS SUPABASE_PUBLIC_URL KONG_HTTP_PORT KONG_HTTPS_PORT STUDIO_PORT POSTGRES_PORT ENABLE_EMAIL_SIGNUP ENABLE_EMAIL_AUTOCONFIRM ENABLE_ANONYMOUS_USERS DISABLE_SIGNUP; do sed -i "/^$k=/d" .env; done && echo "${envB64}" | base64 -d >> .env && serviceKey="${serviceKey}" && echo "_OK"`);
 
         // Start the frontend now, in parallel with the lengthy backend image pulls.
@@ -2094,7 +2103,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
           `      retries: 10`,
           ``,
         ].join("\n");
-        const composeB64 = btoa(composeYaml);
+        const composeB64 = b64utf8(composeYaml);
         await exec(conn, `cd ${pgDir} && echo "${composeB64}" | base64 -d > docker-compose.yml`);
 
         const upPg = await exec(conn, `cd ${pgDir} && (docker compose up -d || docker-compose up -d) 2>&1`);
@@ -2146,7 +2155,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
         await startLocalSupabaseEssentials(conn, supaDir, log, true);
         await ensureLocalApiServices(conn, supaDir, supaKongPort, anonKey, log);
         const supaBrowserUrl = resolveBrowserAppBase(body, appPort, enableHttps, httpsDomain, httpsPort);
-        const existingAuthEnvB64 = btoa(buildLocalAuthUrlEnvPatch(body, appPort, supaBrowserUrl, enableHttps, httpsDomain, httpsPort));
+        const existingAuthEnvB64 = b64utf8(buildLocalAuthUrlEnvPatch(body, appPort, supaBrowserUrl, enableHttps, httpsDomain, httpsPort));
         await exec(conn, `cd ${supaDir} && for k in SITE_URL API_EXTERNAL_URL GOTRUE_EXTERNAL_URL ADDITIONAL_REDIRECT_URLS SUPABASE_PUBLIC_URL; do sed -i "/^$k=/d" .env; done && printf '%s' '${existingAuthEnvB64}' | base64 -d >> .env && docker compose restart auth storage rest kong 2>&1 || true`);
         supabaseUrlOverride = supaBrowserUrl;
         supabaseAnonOverride = anonKey;
@@ -2602,8 +2611,8 @@ server {
 import base64, pathlib, re
 p = pathlib.Path(${JSON.stringify(`${repoDir}/docker-compose.yml`)})
 s = p.read_text()
-url = base64.b64decode(${JSON.stringify(btoa(publicBase))}).decode()
-key = base64.b64decode(${JSON.stringify(btoa(anonKey))}).decode()
+url = base64.b64decode(${JSON.stringify(b64utf8(publicBase))}).decode()
+key = base64.b64decode(${JSON.stringify(b64utf8(anonKey))}).decode()
 s = re.sub(r"VITE_SUPABASE_URL:\\s*.*", f"VITE_SUPABASE_URL: '{url}'", s)
 s = re.sub(r"VITE_SUPABASE_PUBLISHABLE_KEY:\\s*.*", f"VITE_SUPABASE_PUBLISHABLE_KEY: '{key}'", s)
 s = re.sub(r"VITE_SUPABASE_PROJECT_ID:\\s*.*", "VITE_SUPABASE_PROJECT_ID: 'local'", s)
@@ -2618,7 +2627,7 @@ else:
 p.write_text(s)
 PY`;
   await exec(conn, patchCompose);
-  const repairAuthEnvB64 = btoa(buildLocalAuthUrlEnvPatch(body, appPort, publicBase));
+  const repairAuthEnvB64 = b64utf8(buildLocalAuthUrlEnvPatch(body, appPort, publicBase));
   await exec(conn, `cd ${supaDir} && for k in SITE_URL API_EXTERNAL_URL GOTRUE_EXTERNAL_URL ADDITIONAL_REDIRECT_URLS SUPABASE_PUBLIC_URL; do sed -i "/^$k=/d" .env; done && printf '%s' '${repairAuthEnvB64}' | base64 -d >> .env && docker compose restart auth storage rest kong 2>&1 || true`);
   await exec(conn, `cd ${repoDir} && (docker compose up -d --build web || docker-compose up -d --build web) 2>&1`);
   await ensureLocalApiServices(conn, supaDir, kongPort, anonKey, log);
@@ -2683,7 +2692,7 @@ async function verifyStorageUploadAtBase(conn: Client, supaDir: string, baseUrl:
   const [statusLine, ...bodyLines] = (result.stdout || "").split("\n");
   const status = (statusLine || "000").trim() || "000";
   const detail = bodyLines.join("\n").trim().replace(/\s+/g, " ").slice(0, 240);
-  await exec(conn, dockerPsql(supaDir, btoa(`delete from storage.objects where bucket_id = '${bucket}' and name = '${testPath.replace(/'/g, "''")}';`), false));
+  await exec(conn, dockerPsql(supaDir, b64utf8(`delete from storage.objects where bucket_id = '${bucket}' and name = '${testPath.replace(/'/g, "''")}';`), false));
   return { label, bucket, ok: /^2\d\d$/.test(status), status, detail };
 }
 

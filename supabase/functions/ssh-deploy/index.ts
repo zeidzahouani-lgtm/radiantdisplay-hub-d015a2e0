@@ -166,6 +166,52 @@ async function startDetachedCompose(conn: Client, repoDir: string, stateDir: str
   }
 }
 
+/**
+ * Create a usable web compose file as soon as the repository is available.
+ * The local backend can take several minutes to start; keeping this scaffold
+ * early makes the deployment resumable and prevents repair actions from
+ * finding a cloned repository without docker-compose.yml.
+ */
+async function prepareEarlyWebDeployment(
+  conn: Client,
+  body: DeployBody,
+  repoDir: string,
+  remoteDir: string,
+  appPort: string,
+  supabaseUrl: string,
+  supabaseKey: string,
+  projectId: string,
+  log: (m: string) => Promise<void> | void,
+) {
+  const publicAppUrl = resolveBrowserAppBase(body, appPort, false);
+  const quoteYaml = (value: string) => `'${(value || "").replace(/'/g, "''")}'`;
+  const compose = `services:
+  web:
+    build:
+      context: .
+      args:
+        VITE_SUPABASE_URL: ${quoteYaml(supabaseUrl)}
+        VITE_SUPABASE_PUBLISHABLE_KEY: ${quoteYaml(supabaseKey)}
+        VITE_SUPABASE_PROJECT_ID: ${quoteYaml(projectId)}
+        VITE_PUBLIC_APP_URL: ${quoteYaml(publicAppUrl)}
+        VITE_APP_BASE_PATH: '/'
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${appPort}:80"
+    restart: unless-stopped
+`;
+  await uploadFile(conn, `${repoDir}/docker-compose.yml`, Buffer.from(compose));
+  await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
+  const required = await exec(conn, `[ -f ${repoDir}/Dockerfile ] && [ -f ${repoDir}/nginx.conf ] && echo OK || echo NO`);
+  if (!(required.stdout || "").includes("OK")) {
+    throw new Error(`Le dépôt ${repoDir} doit contenir Dockerfile et nginx.conf.`);
+  }
+  await log("✓ Déploiement web préparé tôt (reprise automatique possible)");
+  await startDetachedCompose(conn, repoDir, `${remoteDir}/.build`);
+  await log("✓ Build web lancé en arrière-plan pendant la préparation du backend");
+}
+
 async function pollDetachedCompose(
   conn: Client,
   stateDir: string,
@@ -1543,6 +1589,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
   let supabaseUrlOverride = "";
   let supabaseAnonOverride = "";
   let supabaseProjectIdOverride = "";
+  let earlyWebStarted = false;
   // L'edge function est coupée par le runtime après ~400s : on sort proprement avant.
   const deploymentDeadline = Date.now() + 8 * 60 * 1000;
   const ensureDeploymentBudget = async (nextStep: string) => {
@@ -1651,7 +1698,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
           `git remote set-url origin '${gitUrl}' 2>&1 && ` +
           `git fetch --depth 1 origin ${branch} 2>&1 && ` +
           `git reset --hard origin/${branch} 2>&1 && ` +
-          `git clean -fd 2>&1`,
+          `git clean -fd -e docker-compose.yml -e ssl 2>&1`,
         );
         log(pull.stdout.slice(-1500));
         if (pull.code !== 0) {
@@ -1673,6 +1720,23 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
           throw new Error(`Échec du clone Git. Vérifiez l'URL/branche/token. ${clone.stderr.slice(-300)}`);
         }
         log("✓ Repo cloned");
+      }
+
+      // For an external/shared backend all build credentials are already known,
+      // so start the web build before any optional local infrastructure work.
+      if (!installSupabase && !installPostgresOnly) {
+        await prepareEarlyWebDeployment(
+          conn,
+          body,
+          `${remoteDir}/repo`,
+          remoteDir,
+          appPort,
+          body.vite_supabase_url || "",
+          body.vite_supabase_key || "",
+          body.vite_supabase_project_id || "",
+          log,
+        );
+        earlyWebStarted = true;
       }
 
       await ensureDeploymentBudget("installation/contrôle Supabase local");
@@ -1730,6 +1794,21 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
         ].join("\n") + "\n" + buildLocalAuthUrlEnvPatch(body, appPort, supaBrowserUrl, enableHttps, httpsDomain, httpsPort);
         const envB64 = btoa(envPatch);
         await exec(conn, `cd ${supaDir} && for k in POSTGRES_PASSWORD JWT_SECRET ANON_KEY SERVICE_ROLE_KEY SUPABASE_PUBLISHABLE_KEY SUPABASE_SECRET_KEY DASHBOARD_USERNAME DASHBOARD_PASSWORD SITE_URL API_EXTERNAL_URL GOTRUE_EXTERNAL_URL ADDITIONAL_REDIRECT_URLS SUPABASE_PUBLIC_URL KONG_HTTP_PORT KONG_HTTPS_PORT STUDIO_PORT POSTGRES_PORT ENABLE_EMAIL_SIGNUP ENABLE_EMAIL_AUTOCONFIRM ENABLE_ANONYMOUS_USERS DISABLE_SIGNUP; do sed -i "/^$k=/d" .env; done && echo "${envB64}" | base64 -d >> .env && serviceKey="${serviceKey}" && echo "_OK"`);
+
+        // Start the frontend now, in parallel with the lengthy backend image pulls.
+        // This also guarantees docker-compose.yml exists if the edge runtime stops.
+        await prepareEarlyWebDeployment(
+          conn,
+          body,
+          `${remoteDir}/repo`,
+          remoteDir,
+          appPort,
+          supaBrowserUrl,
+          anonKey,
+          "local",
+          log,
+        );
+        earlyWebStarted = true;
 
         log(`→ Starting Supabase containers essentiels (kong:${supaKongPort}, studio:${supaStudioPort}, db:${supaDbPort})…`);
         await syncLocalAuthSafeEnv(conn, supaDir, log);
@@ -1842,6 +1921,18 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
         supabaseAnonOverride = anonKey;
         supabaseProjectIdOverride = "local";
         await log("✓ Supabase local opérationnel (clés réutilisées depuis .env)");
+        await prepareEarlyWebDeployment(
+          conn,
+          body,
+          `${remoteDir}/repo`,
+          remoteDir,
+          appPort,
+          supaBrowserUrl,
+          anonKey,
+          "local",
+          log,
+        );
+        earlyWebStarted = true;
         (globalThis as any).__pendingLocalMigrations = { supaDir, postgresPw };
       }
 
@@ -2049,10 +2140,14 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
         log("✓ Certificat SSL généré");
       }
 
-      await log("→ Build des conteneurs lancé en arrière-plan sur le serveur (docker compose up -d --build)…");
+      await log(earlyWebStarted
+        ? "→ Finalisation du build web déjà lancé en arrière-plan…"
+        : "→ Build des conteneurs lancé en arrière-plan sur le serveur (docker compose up -d --build)…");
       const buildStateDir = `${remoteDir}/.build`;
-      await startDetachedCompose(conn, `${remoteDir}/repo`, buildStateDir);
-      await log("✓ Build détaché démarré — il continue même si cette session se termine.");
+      if (!earlyWebStarted) {
+        await startDetachedCompose(conn, `${remoteDir}/repo`, buildStateDir);
+        await log("✓ Build détaché démarré — il continue même si cette session se termine.");
+      }
       const buildDeadline = Math.min(deploymentDeadline, Date.now() + 4 * 60 * 1000);
       const buildResult = await pollDetachedCompose(conn, buildStateDir, buildDeadline, log);
       if (!buildResult.done) {
@@ -3188,6 +3283,10 @@ async function runQuickUpdate(body: DeployBody, log: (m: string) => Promise<void
     if (!repoPresent) {
       throw new Error(`Aucun dépôt cloné dans ${repoDir}. Lancez d'abord un déploiement complet.`);
     }
+    const appComposePresent = (await exec(conn, `[ -f ${repoDir}/docker-compose.yml ] && echo OK || echo NO`)).stdout.includes("OK");
+    if (!appComposePresent) {
+      throw new Error(`Manifest web absent dans ${repoDir}. Utilisez « Installer / mettre à jour automatiquement » : il recréera le manifeste et reprendra l'installation.`);
+    }
     const supaPresent = (await exec(conn, `[ -f ${supaDir}/docker-compose.yml ] && echo OK || echo NO`)).stdout.includes("OK");
 
     // ===== 1. Git pull =====
@@ -3195,7 +3294,7 @@ async function runQuickUpdate(body: DeployBody, log: (m: string) => Promise<void
     const beforeSha = (await exec(conn, `cd ${repoDir} && git rev-parse HEAD 2>/dev/null || echo none`)).stdout.trim();
     const pull = await exec(
       conn,
-      `cd ${repoDir} && git fetch --depth 1 origin ${branch} 2>&1 && git reset --hard origin/${branch} 2>&1 && git clean -fd 2>&1`,
+      `cd ${repoDir} && git fetch --depth 1 origin ${branch} 2>&1 && git reset --hard origin/${branch} 2>&1 && git clean -fd -e docker-compose.yml -e ssl 2>&1`,
     );
     if (pull.code !== 0) {
       throw new Error(`git pull a échoué : ${pull.stdout.slice(-400)}`);

@@ -168,10 +168,10 @@ async function startDetachedCompose(conn: Client, repoDir: string, stateDir: str
 }
 
 /**
- * Create a usable web compose file as soon as the repository is available.
- * The local backend can take several minutes to start; keeping this scaffold
- * early makes the deployment resumable and prevents repair actions from
- * finding a cloned repository without docker-compose.yml.
+ * Create a usable web compose scaffold as soon as the repository is available.
+ * Do not build here: the definitive nginx proxy and port configuration are
+ * written later. Starting two concurrent builds can leave the stale image
+ * running and race on the shared build status files.
  */
 async function prepareEarlyWebDeployment(
   conn: Client,
@@ -210,8 +210,7 @@ async function prepareEarlyWebDeployment(
     throw new Error(`Le dépôt ${repoDir} doit contenir Dockerfile et nginx.conf.`);
   }
   await log("✓ Déploiement web préparé tôt (reprise automatique possible)");
-  await startDetachedCompose(conn, repoDir, `${remoteDir}/.build`);
-  await log("✓ Build web lancé en arrière-plan pendant la préparation du backend");
+  await log("✓ Build différé jusqu'à l'écriture du proxy Auth/REST/Storage définitif");
 }
 
 async function patchRemoteBuildEntrypoint(conn: Client, repoDir: string, log: (m: string) => Promise<void> | void) {

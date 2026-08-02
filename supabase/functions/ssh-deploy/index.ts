@@ -157,7 +157,7 @@ async function startDetachedCompose(conn: Client, repoDir: string, stateDir: str
     `printf '%s\\n' '#!/usr/bin/env bash' 'set -o pipefail' ` +
     `'cd ${repoDir} || exit 1' ` +
     `'if docker compose version >/dev/null 2>&1; then COMPOSE=(docker compose); elif command -v docker-compose >/dev/null 2>&1; then COMPOSE=(docker-compose); else echo "Docker Compose est introuvable" > ${stateDir}/build.log; echo 127 > ${stateDir}/build.code; exit 127; fi' ` +
-    `'"${COMPOSE[@]}" up -d --build > ${stateDir}/build.log 2>&1' ` +
+    `'"\${COMPOSE[@]}" up -d --build > ${stateDir}/build.log 2>&1' ` +
     `'echo $? > ${stateDir}/build.code' > ${script} && ` +
     `chmod +x ${script} && rm -f ${stateDir}/build.code && : > ${stateDir}/build.log && ` +
     `(setsid nohup ${script} >/dev/null 2>&1 & ) && echo STARTED`;

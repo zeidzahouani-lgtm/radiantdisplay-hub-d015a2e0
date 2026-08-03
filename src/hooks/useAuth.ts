@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import type { User, Session } from "@supabase/supabase-js";
+import { buildAppUrl } from "@/lib/env";
 
 export function useAuth() {
   const [user, setUser] = useState<User | null>(null);
@@ -29,7 +30,7 @@ export function useAuth() {
       password,
       options: {
         data: { display_name: displayName },
-        emailRedirectTo: window.location.origin,
+        emailRedirectTo: buildAppUrl("/"),
       },
     });
     if (error) throw error;
@@ -46,7 +47,7 @@ export function useAuth() {
 
   const resetPassword = async (email: string) => {
     const { error } = await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: `${window.location.origin}/reset-password`,
+      redirectTo: buildAppUrl("/reset-password"),
     });
     if (error) throw error;
   };

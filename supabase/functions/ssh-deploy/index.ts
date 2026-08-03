@@ -217,6 +217,7 @@ async function prepareEarlyWebDeployment(
 `;
   await uploadFile(conn, `${repoDir}/docker-compose.yml`, Buffer.from(compose));
   await patchRemoteBuildEntrypoint(conn, repoDir, log);
+  await patchRemoteLanOriginFallback(conn, repoDir, log);
   await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
 
   // A remote branch (or a shallow/partial clone) may not ship nginx.conf.
@@ -1876,7 +1877,9 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
   const port = body.port ?? 22;
   const remoteDir = body.remote_dir || "/opt/screenflow";
   const appPort = body.app_port || "8080";
-  const localIp = /^\d{1,3}(\.\d{1,3}){3}$/.test((body.local_ip || "").trim()) ? body.local_ip!.trim() : "127.0.0.1";
+  let localIp = /^\d{1,3}(\.\d{1,3}){3}$/.test((body.local_ip || "").trim()) && !/^127\./.test((body.local_ip || "").trim())
+    ? (body.local_ip || "").trim()
+    : "";
   const branch = body.git_branch || "main";
   const requestedEnableHttps = !!body.enable_https;
   const httpsPort = body.https_port || "8443";
@@ -1925,6 +1928,15 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
   await log(`→ Connecting to ${body.username}@${body.host}:${port}…`);
   const conn = await ssh({ host: body.host, port, username: body.username, password: body.password });
   await log("✓ SSH connection established");
+  if (!localIp) {
+    const detectedLan = await exec(conn, `hostname -I 2>/dev/null | tr ' ' '\n' | awk '/^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/ {print; exit}'`);
+    localIp = (detectedLan.stdout || "").trim().split(/\s+/)[0] || "";
+  }
+  if (installSupabase && !localIp) {
+    try { conn.end(); } catch (_) {}
+    throw new Error("Impossible de détecter l'adresse IP LAN réelle du serveur. Renseignez « Adresse IP locale » (ex. 192.168.0.25) avant le déploiement.");
+  }
+  if (localIp) await log(`✓ Adresse LAN utilisée pour les validations navigateur : ${localIp}`);
   if (requestedEnableHttps && installSupabase) {
     await log("ℹ HTTPS auto-signé désactivé pour ce déploiement local : l'app et son API passent en HTTP via le proxy local pour éviter les erreurs de certificat sur les uploads/écrans.");
   }
@@ -2383,8 +2395,9 @@ ${preflightLocation}
   location /storage/v1/ { ${storageProxy("https")} }
   location /realtime/v1/ { ${realtimeProxy("https")} }
 ${localFunctionLocations}
-  location / { try_files $uri $uri/ /index.html; }
   location /assets/ { expires 1y; add_header Cache-Control "public, immutable"; }
+  location = /index.html { add_header Cache-Control "no-store, no-cache, must-revalidate" always; expires -1; }
+  location / { add_header Cache-Control "no-cache" always; try_files $uri $uri/ /index.html; }
 }
 `
         : `client_max_body_size 1024m;
@@ -2400,8 +2413,9 @@ ${preflightLocation}
   location /storage/v1/ { ${storageProxy("http")} }
   location /realtime/v1/ { ${realtimeProxy("http")} }
 ${localFunctionLocations}
-  location / { try_files $uri $uri/ /index.html; }
   location /assets/ { expires 1y; add_header Cache-Control "public, immutable"; }
+  location = /index.html { add_header Cache-Control "no-store, no-cache, must-revalidate" always; expires -1; }
+  location / { add_header Cache-Control "no-cache" always; try_files $uri $uri/ /index.html; }
 }
 `;
       const portsBlock = enableHttps
@@ -2420,7 +2434,7 @@ ${localFunctionLocations}
     build:
       context: .
       args:
-        VITE_SUPABASE_URL: '${escEnv(installSupabase ? publicAppUrl : (supabaseUrlOverride || body.vite_supabase_url || ""))}'
+        VITE_SUPABASE_URL: '${escEnv(installSupabase ? "__SCREENFLOW_SAME_ORIGIN__" : (supabaseUrlOverride || body.vite_supabase_url || ""))}'
         VITE_SUPABASE_PUBLISHABLE_KEY: '${escEnv(supabaseAnonOverride || body.vite_supabase_key || "")}'
         VITE_SUPABASE_PROJECT_ID: '${escEnv(supabaseProjectIdOverride || body.vite_supabase_project_id || "")}'
         VITE_PUBLIC_APP_URL: '${escEnv(publicAppUrl)}'
@@ -2433,7 +2447,14 @@ ${portsBlock}
       await uploadFile(conn, `${remoteDir}/repo/Dockerfile`, Buffer.from(dockerfile));
       await uploadFile(conn, `${remoteDir}/repo/nginx.conf`, Buffer.from(nginxConf));
       await uploadFile(conn, `${remoteDir}/repo/docker-compose.yml`, Buffer.from(compose));
+      await patchRemoteLanOriginFallback(conn, `${remoteDir}/repo`, log);
       await patchRemoteRuntimeSupabaseClient(conn, `${remoteDir}/repo`, log);
+      if (installSupabase) {
+        const buildInputCheck = await exec(conn, `set -e; grep -Fq "projectId === 'local'" ${remoteDir}/repo/src/integrations/supabase/runtime-client.ts; grep -Fq 'src/integrations/supabase/runtime-client.ts' ${remoteDir}/repo/vite.config.ts; grep -Fq "VITE_SUPABASE_URL: '__SCREENFLOW_SAME_ORIGIN__'" ${remoteDir}/repo/docker-compose.yml; grep -Fq "VITE_SUPABASE_PROJECT_ID: 'local'" ${remoteDir}/repo/docker-compose.yml`);
+        if (buildInputCheck.code !== 0) {
+          throw new Error("Les invariants du client LAN sont absents des fichiers de build du premier déploiement.");
+        }
+      }
       log("✓ Build files ready");
 
       if (enableHttps) {
@@ -2506,10 +2527,12 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
 
     // App health
     const appUrl = resolveBrowserAppBase(body, appPort, enableHttps, httpsDomain, httpsPort);
-    const localAppUrl = enableHttps ? `https://${localIp}:${httpsPort}` : `http://${localIp}:${appPort}`;
+    const localAppUrl = enableHttps
+      ? `https://${localIp}${httpsPort === "443" ? "" : `:${httpsPort}`}`
+      : `http://${localIp}${appPort === "80" ? "" : `:${appPort}`}`;
     const appCheck = await exec(conn, `curl -k -s -o /dev/null -w "%{http_code}" --max-time 10 ${localAppUrl} || echo FAIL`);
     const appCode = (appCheck.stdout || "").trim();
-    connectivity.app = { ok: /^(200|301|302|304)$/.test(appCode), detail: `HTTP ${appCode} sur ${localAppUrl} (vérification 127.0.0.1)` };
+    connectivity.app = { ok: /^(200|301|302|304)$/.test(appCode), detail: `HTTP ${appCode} sur ${localAppUrl} (IP LAN réelle)` };
     await log(`  • App         : ${connectivity.app.ok ? "✓" : "✗"} ${connectivity.app.detail}`);
 
     // A loopback success does not prove that the host firewall/provider allows
@@ -2552,9 +2575,9 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
 
       // A healthy Kong is not enough: browsers only use the web container's
       // same-origin proxy. Validate that exact route before declaring success.
-      const proxyBase = enableHttps ? `https://127.0.0.1:${httpsPort}` : `http://127.0.0.1:${appPort}`;
+      const proxyBase = localAppUrl;
       const proxyRest = await exec(conn, `curl -k -sS -m 10 -o /dev/null -w "%{http_code}" ${shQuote(`${proxyBase}/rest/v1/`)} -H ${shQuote(`apikey: ${supabaseAnonOverride}`)} -H ${shQuote(`Authorization: Bearer ${supabaseAnonOverride}`)} 2>/dev/null || true`);
-      const proxyAuth = await exec(conn, `curl -k -sS -m 10 -o /dev/null -w "%{http_code}" ${shQuote(`${proxyBase}/auth/v1/health`)} -H ${shQuote(`apikey: ${supabaseAnonOverride}`)} 2>/dev/null || true`);
+      const proxyAuth = await exec(conn, `curl -k -sS -m 10 -D /tmp/sf_initial_lan_auth_headers.txt -o /dev/null -w "%{http_code}" ${shQuote(`${proxyBase}/auth/v1/health`)} -H ${shQuote(`Origin: ${proxyBase}`)} -H ${shQuote(`apikey: ${supabaseAnonOverride}`)} 2>/dev/null || true`);
       const proxyStorage = await exec(conn, `curl -k -sS -m 10 -o /dev/null -w "%{http_code}" ${shQuote(`${proxyBase}/storage/v1/bucket`)} -H ${shQuote(`apikey: ${supabaseAnonOverride}`)} -H ${shQuote(`Authorization: Bearer ${supabaseAnonOverride}`)} 2>/dev/null || true`);
       const proxyRestCode = (proxyRest.stdout || "").trim();
       const proxyAuthCode = (proxyAuth.stdout || "").trim();
@@ -2568,6 +2591,11 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
         const webLogs = await exec(conn, `cd ${remoteDir}/repo && docker compose logs --tail=100 web 2>&1 || true`);
         throw new Error(`Le backend direct répond, mais le proxy web utilisé par le navigateur est invalide (${connectivity.web_proxy.detail}). ${(`${webLogs.stdout}${webLogs.stderr}`).slice(-1800)}`);
       }
+      const corsProbe = await exec(conn, `grep -Fqi ${shQuote(`Access-Control-Allow-Origin: ${proxyBase}`)} /tmp/sf_initial_lan_auth_headers.txt`);
+      if (corsProbe.code !== 0) {
+        throw new Error(`Le proxy répond via le LAN mais ses en-têtes CORS n'autorisent pas l'origine navigateur ${proxyBase}.`);
+      }
+      await log(`  • CORS navigateur : ✓ origine LAN ${proxyBase} autorisée`);
     }
 
     if (installPostgresOnly) {
@@ -2585,7 +2613,7 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
           (await readRemoteEnv(conn, `${supaDir}/.env`, "SERVICE_ROLE_KEY")) ||
           (await readRemoteEnv(conn, `${supaDir}/.env`, "SUPABASE_SECRET_KEY"));
         if (!serviceKey) {
-          await log("⚠ SERVICE_ROLE_KEY introuvable — admin par défaut non créé. Utilisez 'Réinitialiser le mot de passe admin' manuellement.");
+          throw new Error("SERVICE_ROLE_KEY introuvable : impossible de créer et valider l'admin local.");
         } else {
           await ensureLocalAuthGateway(conn, supaDir, supaKongPort, log);
           await upsertDefaultAdminViaAuthApi(conn, supaDir, supaKongPort, serviceKey, DEFAULT_ADMIN_PASSWORD, log);
@@ -2595,7 +2623,7 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
           // Confirme explicitement Auth + Storage via l'IP locale
           await log(`→ Confirmation finale Auth/Storage via ${supabaseUrlOverride || appUrl}…`);
           try {
-            const loginProxyBase = enableHttps ? `https://127.0.0.1:${httpsPort}` : `http://127.0.0.1:${appPort}`;
+            const loginProxyBase = localAppUrl;
             await verifyAuthLoginFromServer(
               conn,
               loginProxyBase,
@@ -2603,12 +2631,11 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
               DEFAULT_ADMIN_EMAIL,
               DEFAULT_ADMIN_PASSWORD,
               log,
-              buildDirectKongAuthLoginCommand(supaDir, supabaseAnonOverride, DEFAULT_ADMIN_EMAIL, DEFAULT_ADMIN_PASSWORD),
             );
             connectivity.auth_login = { ok: true, detail: `Login admin OK via le proxy web ${loginProxyBase}` };
           } catch (authErr: any) {
             connectivity.auth_login = { ok: false, detail: (authErr?.message || String(authErr)).slice(0, 300) };
-            await log("⚠ Confirmation Auth échouée : " + connectivity.auth_login.detail);
+            throw new Error("Le login admin via l'adresse LAN a échoué : " + connectivity.auth_login.detail);
           }
           const storageConfirm = await exec(conn, `curl -k -s -o /dev/null -w "%{http_code}" --max-time 10 -H "apikey: ${supabaseAnonOverride}" -H "Authorization: Bearer ${supabaseAnonOverride}" "http://127.0.0.1:${supaKongPort}/storage/v1/bucket" || echo FAIL`);
           const storageCode = (storageConfirm.stdout || "").trim();
@@ -2616,8 +2643,7 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
           await log(`  • Storage confirmation : ${connectivity.storage_confirm.ok ? "✓" : "✗"} ${connectivity.storage_confirm.detail}`);
         }
       } catch (adminErr: any) {
-        await log("⚠ Création automatique de l'admin échouée : " + (adminErr?.message || String(adminErr)));
-        await log("  → Vous pouvez relancer manuellement via 'Réinitialiser le mot de passe admin'.");
+        throw new Error("Déploiement arrêté : le compte admin local ou son login LAN n'est pas opérationnel. " + (adminErr?.message || String(adminErr)));
       }
     }
 

@@ -419,12 +419,18 @@ function buildRuntimeSupabaseClientHotfix() {
 import { createClient } from '@supabase/supabase-js';
 import type { Database } from './types';
 
-const configuredUrl = (import.meta.env.VITE_SUPABASE_URL || '').trim().replace(/\/$/, '');
+function stripTrailingSlash(value: string) {
+  let out = (value || '').trim();
+  while (out.endsWith('/')) out = out.slice(0, -1);
+  return out;
+}
+
+const configuredUrl = stripTrailingSlash(import.meta.env.VITE_SUPABASE_URL || '');
 const publishableKey = (import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY || '').trim();
 const projectId = (import.meta.env.VITE_SUPABASE_PROJECT_ID || '').trim();
 
 function runtimeOrigin() {
-  if (typeof window !== 'undefined' && window.location?.origin) return window.location.origin.replace(/\/$/, '');
+  if (typeof window !== 'undefined' && window.location?.origin) return stripTrailingSlash(window.location.origin);
   return '';
 }
 

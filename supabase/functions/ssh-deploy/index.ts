@@ -482,7 +482,13 @@ if 'src/integrations/supabase/runtime-client.ts' not in s:
     p.write_text(s)
 print('OK')
 PY`;
-  await exec(conn, vitePatch);
+  const result = await exec(conn, vitePatch);
+  if (result.code !== 0 || !(result.stdout || "").includes("OK")) {
+    throw new Error(
+      "Impossible d'activer le client backend runtime pour le LAN : " +
+      (result.stderr || result.stdout || "alias Vite introuvable").slice(-700),
+    );
+  }
   await log("✓ Client backend runtime ajouté : accès local LAN → appels API sur la même adresse");
 }
 
@@ -3465,6 +3471,7 @@ async function runRepairLanLogin(body: DeployBody, log: (m: string) => Promise<v
     await log("✓ SSH connecté");
     const pull = await exec(conn, `cd ${repoDir} && (git fetch --all --prune && git reset --hard @{u}) 2>&1 | tail -n 5`);
     await log(`→ Dépôt distant synchronisé${pull.code === 0 ? "" : " (git indisponible, patch local appliqué)"}`);
+    await patchRemoteBuildEntrypoint(conn, repoDir, log);
     await patchRemoteLanOriginFallback(conn, repoDir, log);
     await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
     const kongPort = await readRemoteEnv(conn, `${supaDir}/.env`, "KONG_HTTP_PORT")
@@ -3523,6 +3530,18 @@ async function runRepairLanLogin(body: DeployBody, log: (m: string) => Promise<v
       throw new Error(`Le vrai login admin via l'adresse LAN échoue encore (HTTP ${realLoginCode || "000"})${detail.stdout ? ` : ${detail.stdout.trim()}` : ""}`);
     }
     await log(`✓ Connexion admin réelle validée de bout en bout via le proxy LAN (HTTP ${realLoginCode})`);
+    const cid = (await exec(conn, `cd ${repoDir} && (docker compose ps -q web || docker-compose ps -q web) 2>/dev/null | head -1`)).stdout.trim();
+    if (!cid) {
+      throw new Error("Le conteneur web est introuvable après la réparation LAN.");
+    }
+    const bundleCheck = await exec(conn, `docker exec ${cid} sh -c 'set -e; grep -R -q "__SCREENFLOW_SAME_ORIGIN__" /usr/share/nginx/html/assets; grep -R -q "location.origin" /usr/share/nginx/html/assets; if grep -R -q "const [A-Za-z0-9_$]*=\"__SCREENFLOW_SAME_ORIGIN__\".*createClient\|YTe(\"__SCREENFLOW_SAME_ORIGIN__\"" /usr/share/nginx/html/assets; then exit 12; fi' 2>&1`);
+    if (bundleCheck.code !== 0) {
+      throw new Error(
+        `Le bundle web livré n'utilise pas correctement l'origine LAN (code ${bundleCheck.code}). ` +
+        "La réparation est arrêtée au lieu de signaler un faux succès.",
+      );
+    }
+    await log("✓ Bundle navigateur vérifié : origine LAN dynamique active dans les fichiers réellement servis");
     const publicBase = resolveBrowserAppBase(body, appPort);
     await log(`✓ Correctif LAN appliqué et cache HTML désactivé. Ouvrez ${publicBase}`);
     return { action: "repair_lan_login", ok: true, url: publicBase, auth_http: authSettingsCode, login_http: realLoginCode };

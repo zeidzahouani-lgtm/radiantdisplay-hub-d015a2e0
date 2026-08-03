@@ -7,6 +7,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { useNavigate } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
+import { buildAppUrl } from "@/lib/env";
 import { toast } from "sonner";
 import {
   ShieldCheck, Loader2, CheckCircle2, AlertCircle, Eye, EyeOff, Building2, DatabaseZap, RefreshCw,
@@ -94,7 +95,7 @@ export default function FirstAdminLogin() {
       const { data: signUp, error: signUpErr } = await supabase.auth.signUp({
         email: email.trim(),
         password,
-        options: { emailRedirectTo: window.location.origin },
+        options: { emailRedirectTo: buildAppUrl("/") },
       });
 
       // If user already exists, try sign-in to get its id

@@ -2685,6 +2685,16 @@ if re.search(r"VITE_APP_BASE_PATH:\\s*", s):
     s = re.sub(r"VITE_APP_BASE_PATH:\\s*.*", "VITE_APP_BASE_PATH: '/'", s)
 else:
     s = re.sub(r"(VITE_PUBLIC_APP_URL:.*\\n)", "\\1        VITE_APP_BASE_PATH: '/'\\n", s)
+required = {
+    "VITE_SUPABASE_URL": "VITE_SUPABASE_URL: '__SCREENFLOW_SAME_ORIGIN__'",
+    "VITE_SUPABASE_PUBLISHABLE_KEY": "VITE_SUPABASE_PUBLISHABLE_KEY: '" + key + "'",
+    "VITE_SUPABASE_PROJECT_ID": "VITE_SUPABASE_PROJECT_ID: 'local'",
+    "VITE_PUBLIC_APP_URL": "VITE_PUBLIC_APP_URL: '" + url.replace("'", "''") + "'",
+    "VITE_APP_BASE_PATH": "VITE_APP_BASE_PATH: '/'",
+}
+missing = [name for name, expected in required.items() if expected not in s]
+if missing:
+    raise SystemExit("build args absents après patch: " + ", ".join(missing))
 p.write_text(s)
 PY`;
   const composePatchResult = await exec(conn, patchCompose);
@@ -2701,12 +2711,16 @@ PY`;
   const proxyBase = publicBase;
   const probe = await exec(conn, `curl -sS -m 10 -o /tmp/sf_proxy_bucket.txt -w "%{http_code}" ${shQuote(`${proxyBase}/storage/v1/bucket`)} -H ${shQuote(`apikey: ${anonKey}`)} -H ${shQuote(`Authorization: Bearer ${anonKey}`)} 2>/dev/null || true`);
   const probeRest = await exec(conn, `curl -sS -m 10 -o /dev/null -w "%{http_code}" ${shQuote(`${proxyBase}/rest/v1/`)} -H ${shQuote(`apikey: ${anonKey}`)} -H ${shQuote(`Authorization: Bearer ${anonKey}`)} 2>/dev/null || true`);
-  const probeAuth = await exec(conn, `curl -sS -m 10 -o /dev/null -w "%{http_code}" ${shQuote(`${proxyBase}/auth/v1/health`)} -H ${shQuote(`apikey: ${anonKey}`)} 2>/dev/null || true`);
+  const probeAuth = await exec(conn, `curl -sS -m 10 -D /tmp/sf_lan_auth_headers.txt -o /dev/null -w "%{http_code}" ${shQuote(`${proxyBase}/auth/v1/health`)} -H ${shQuote(`Origin: ${proxyBase}`)} -H ${shQuote(`apikey: ${anonKey}`)} 2>/dev/null || true`);
   const storageCode = (probe.stdout || "").trim();
   const restCode = (probeRest.stdout || "").trim();
   const authCode = (probeAuth.stdout || "").trim();
   if (!/^(2\d\d|401|403)$/.test(storageCode) || !/^(2\d\d|401|403)$/.test(restCode) || !/^2\d\d$/.test(authCode)) {
     throw new Error(`Le proxy web local ne relaie pas correctement la base/Auth : Storage HTTP ${storageCode || "000"}, REST HTTP ${restCode || "000"}, Auth HTTP ${authCode || "000"}`);
+  }
+  const corsProbe = await exec(conn, `grep -Fqi ${shQuote(`Access-Control-Allow-Origin: ${proxyBase}`)} /tmp/sf_lan_auth_headers.txt`);
+  if (corsProbe.code !== 0) {
+    throw new Error(`Le proxy LAN répond mais ne reconnaît pas l'origine navigateur ${proxyBase}.`);
   }
   await log(`✓ URL API corrigée. Ouvrez l'application en HTTP : ${publicBase}`);
   await log(`  • Vérif réelle via l'IP LAN ${proxyBase} → Storage HTTP ${storageCode}, REST HTTP ${restCode}, Auth HTTP ${authCode}`);

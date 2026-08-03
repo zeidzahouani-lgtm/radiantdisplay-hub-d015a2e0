@@ -414,7 +414,7 @@ function buildLocalAuthUrlEnvPatch(body: DeployBody, appPort: string, publicBase
 }
 
 function buildRuntimeSupabaseClientHotfix() {
-  return `// Runtime client used by ScreenFlow SSH repair: keep backend calls on the current app origin for local LAN access.
+  return `// Runtime client used by ScreenFlow SSH repair: backend calls always stay on the current app origin.
 import { createClient } from '@supabase/supabase-js';
 import type { Database } from './types';
 
@@ -427,40 +427,22 @@ function runtimeOrigin() {
   return '';
 }
 
-function hostOf(value: string) {
-  try { return new URL(value).hostname.toLowerCase(); } catch { return ''; }
-}
-
-function isLanHost(hostname: string) {
-  const host = hostname.toLowerCase().replace(/^\\[|\\]$/g, '');
-  if (!host) return false;
-  if (host === 'localhost' || host.endsWith('.local') || !host.includes('.')) return true;
-  if (/^127\./.test(host) || /^169\.254\./.test(host)) return true;
-  if (/^10\./.test(host) || /^192\.168\./.test(host)) return true;
-  if (host === '::1' || /^fe[89ab][0-9a-f]:/.test(host) || /^f[cd][0-9a-f]{2}:/.test(host)) return true;
-  const m = host.match(/^172\.(\d{1,2})\./);
-  if (!m) return false;
-  const n = Number.parseInt(m[1], 10);
-  return n >= 16 && n <= 31;
-}
-
 function resolveSupabaseUrl() {
   const origin = runtimeOrigin();
-  // A self-hosted installation must always use the exact origin from which
-  // the browser loaded the app (LAN IP, WAN IP, hostname, HTTP or HTTPS).
-  if (origin && projectId === 'local') return origin;
   const marker = configuredUrl === '__SCREENFLOW_SAME_ORIGIN__' || configuredUrl === 'same-origin' || configuredUrl === 'runtime:same-origin';
-  if (marker && origin) return origin;
-  if (origin && isLanHost(hostOf(origin)) && hostOf(origin) !== hostOf(configuredUrl)) return origin;
-  void projectId;
+  // Self-hosted builds are deliberately origin-agnostic. This removes every
+  // dependency on the configured WAN address, NAT loopback and LAN detection.
+  if (origin && (projectId === 'local' || marker)) return origin;
   return configuredUrl;
 }
 
 export const supabase = createClient<Database>(resolveSupabaseUrl(), publishableKey, {
   auth: {
     storage: localStorage,
+    storageKey: 'screenflow-local-auth-v3',
     persistSession: true,
     autoRefreshToken: true,
+    detectSessionInUrl: true,
   },
 });
 `;
@@ -2665,43 +2647,24 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
 async function repairLocalApiUrlOnExistingDeployment(conn: Client, body: DeployBody, kongPort: string, anonKey: string, log: (m: string) => Promise<void> | void) {
   const remoteDir = body.remote_dir || "/opt/screenflow";
   const appPort = body.app_port || "8080";
-  const localIp = /^\d{1,3}(\.\d{1,3}){3}$/.test((body.local_ip || "").trim()) ? body.local_ip!.trim() : "127.0.0.1";
-  const publicBase = resolveBrowserAppBase(body, appPort);
+  const requestedLocalIp = (body.local_ip || "").trim();
+  const detectedLan = await exec(conn, `hostname -I 2>/dev/null | tr ' ' '\n' | awk '/^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/ {print; exit}'`);
+  const detectedLanIp = (detectedLan.stdout || "").trim().split(/\s+/)[0] || "";
+  const localIp = /^\d{1,3}(\.\d{1,3}){3}$/.test(requestedLocalIp) && !/^127\./.test(requestedLocalIp)
+    ? requestedLocalIp
+    : detectedLanIp;
+  if (!localIp) {
+    throw new Error("Aucune IP LAN privée détectée sur le serveur. Renseignez son adresse réelle (ex. 192.168.0.25) dans « Adresse IP locale du serveur ».");
+  }
+  const publicBase = `http://${localIp}${appPort === "80" ? "" : `:${appPort}`}`;
+  const lanBody: DeployBody = { ...body, local_ip: localIp, vite_public_app_url: publicBase };
   const repoDir = `${remoteDir}/repo`;
   const supaDir = `${remoteDir}/supabase`;
 
-  await log(`→ Réparation URL API navigateur : ${publicBase} (vérifications serveur via ${localIp})`);
+  await log(`→ IP LAN réelle retenue : ${localIp}`);
+  await log(`→ Réparation URL API navigateur : ${publicBase}`);
 
-  const nginxConf = `client_max_body_size 1024m;
-server {
-  listen 80;
-  server_name _;
-  client_max_body_size 1024m;
-  root /usr/share/nginx/html;
-  index index.html;
-  proxy_connect_timeout 10s;
-  proxy_send_timeout 3600s;
-  proxy_read_timeout 3600s;
-  set $cors_origin $http_origin;
-  error_page 418 = @cors_preflight;
-  location @cors_preflight {
-    add_header Access-Control-Allow-Origin $cors_origin always;
-    add_header Vary Origin always;
-    add_header Access-Control-Allow-Methods "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS" always;
-    add_header Access-Control-Allow-Headers "authorization, apikey, content-type, x-client-info, x-upsert, prefer, accept-profile, content-profile, range, x-requested-with, x-supabase-api-version, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version" always;
-    add_header Access-Control-Max-Age 86400 always;
-    add_header Content-Length 0 always;
-    return 204;
-  }
-  location /auth/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/auth/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; }
-  location /rest/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/rest/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; client_max_body_size 50m; }
-  location /storage/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/storage/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; client_max_body_size 1024m; proxy_request_buffering off; proxy_buffering off; proxy_read_timeout 3600s; proxy_send_timeout 3600s; }
-  location /functions/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/functions/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; }
-  location /realtime/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/realtime/v1/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; proxy_read_timeout 3600s; proxy_send_timeout 3600s; }
-  location /assets/ { expires 1y; add_header Cache-Control "public, immutable"; }
-  location / { try_files $uri $uri/ /index.html; }
-}
-`;
+  const nginxConf = buildUploadRepairNginxConf(kongPort);
 
   await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(nginxConf));
   await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
@@ -2722,25 +2685,45 @@ if re.search(r"VITE_APP_BASE_PATH:\\s*", s):
     s = re.sub(r"VITE_APP_BASE_PATH:\\s*.*", "VITE_APP_BASE_PATH: '/'", s)
 else:
     s = re.sub(r"(VITE_PUBLIC_APP_URL:.*\\n)", "\\1        VITE_APP_BASE_PATH: '/'\\n", s)
+required = {
+    "VITE_SUPABASE_URL": "VITE_SUPABASE_URL: '__SCREENFLOW_SAME_ORIGIN__'",
+    "VITE_SUPABASE_PUBLISHABLE_KEY": "VITE_SUPABASE_PUBLISHABLE_KEY: '" + key + "'",
+    "VITE_SUPABASE_PROJECT_ID": "VITE_SUPABASE_PROJECT_ID: 'local'",
+    "VITE_PUBLIC_APP_URL": "VITE_PUBLIC_APP_URL: '" + url.replace("'", "''") + "'",
+    "VITE_APP_BASE_PATH": "VITE_APP_BASE_PATH: '/'",
+}
+missing = [name for name, expected in required.items() if expected not in s]
+if missing:
+    raise SystemExit("build args absents après patch: " + ", ".join(missing))
 p.write_text(s)
 PY`;
-  await exec(conn, patchCompose);
-  const repairAuthEnvB64 = b64utf8(buildLocalAuthUrlEnvPatch(body, appPort, publicBase));
+  const composePatchResult = await exec(conn, patchCompose);
+  if (composePatchResult.code !== 0) {
+    throw new Error("Impossible d'imposer le mode backend même-origine dans docker-compose.yml : " + (composePatchResult.stderr || composePatchResult.stdout).slice(-700));
+  }
+  const repairAuthEnvB64 = b64utf8(buildLocalAuthUrlEnvPatch(lanBody, appPort, publicBase));
   await exec(conn, `cd ${supaDir} && for k in SITE_URL API_EXTERNAL_URL GOTRUE_EXTERNAL_URL ADDITIONAL_REDIRECT_URLS SUPABASE_PUBLIC_URL; do sed -i "/^$k=/d" .env; done && printf '%s' '${repairAuthEnvB64}' | base64 -d >> .env && docker compose restart auth storage rest kong 2>&1 || true`);
-  await exec(conn, `cd ${repoDir} && (docker compose up -d --build web || docker-compose up -d --build web) 2>&1`);
+  const rebuild = await exec(conn, `cd ${repoDir} && (docker compose build --no-cache web && docker compose up -d --force-recreate web) 2>&1`);
+  if (rebuild.code !== 0) {
+    throw new Error("Reconstruction propre du client LAN échouée : " + (rebuild.stdout || rebuild.stderr).slice(-1800));
+  }
   await ensureLocalApiServices(conn, supaDir, kongPort, anonKey, log);
-  const proxyBase = `http://127.0.0.1:${appPort}`;
+  const proxyBase = publicBase;
   const probe = await exec(conn, `curl -sS -m 10 -o /tmp/sf_proxy_bucket.txt -w "%{http_code}" ${shQuote(`${proxyBase}/storage/v1/bucket`)} -H ${shQuote(`apikey: ${anonKey}`)} -H ${shQuote(`Authorization: Bearer ${anonKey}`)} 2>/dev/null || true`);
   const probeRest = await exec(conn, `curl -sS -m 10 -o /dev/null -w "%{http_code}" ${shQuote(`${proxyBase}/rest/v1/`)} -H ${shQuote(`apikey: ${anonKey}`)} -H ${shQuote(`Authorization: Bearer ${anonKey}`)} 2>/dev/null || true`);
-  const probeAuth = await exec(conn, `curl -sS -m 10 -o /dev/null -w "%{http_code}" ${shQuote(`${proxyBase}/auth/v1/health`)} -H ${shQuote(`apikey: ${anonKey}`)} 2>/dev/null || true`);
+  const probeAuth = await exec(conn, `curl -sS -m 10 -D /tmp/sf_lan_auth_headers.txt -o /dev/null -w "%{http_code}" ${shQuote(`${proxyBase}/auth/v1/health`)} -H ${shQuote(`Origin: ${proxyBase}`)} -H ${shQuote(`apikey: ${anonKey}`)} 2>/dev/null || true`);
   const storageCode = (probe.stdout || "").trim();
   const restCode = (probeRest.stdout || "").trim();
   const authCode = (probeAuth.stdout || "").trim();
   if (!/^(2\d\d|401|403)$/.test(storageCode) || !/^(2\d\d|401|403)$/.test(restCode) || !/^2\d\d$/.test(authCode)) {
     throw new Error(`Le proxy web local ne relaie pas correctement la base/Auth : Storage HTTP ${storageCode || "000"}, REST HTTP ${restCode || "000"}, Auth HTTP ${authCode || "000"}`);
   }
+  const corsProbe = await exec(conn, `grep -Fqi ${shQuote(`Access-Control-Allow-Origin: ${proxyBase}`)} /tmp/sf_lan_auth_headers.txt`);
+  if (corsProbe.code !== 0) {
+    throw new Error(`Le proxy LAN répond mais ne reconnaît pas l'origine navigateur ${proxyBase}.`);
+  }
   await log(`✓ URL API corrigée. Ouvrez l'application en HTTP : ${publicBase}`);
-  await log(`  • Vérif via le conteneur web ${proxyBase} → Storage HTTP ${storageCode}, REST HTTP ${restCode}, Auth HTTP ${authCode}`);
+  await log(`  • Vérif réelle via l'IP LAN ${proxyBase} → Storage HTTP ${storageCode}, REST HTTP ${restCode}, Auth HTTP ${authCode}`);
   (globalThis as any).__lastDeployResult = { action: "repair_local_api_url", ok: true, url: publicBase, supabase_local: { url: publicBase, anon_key: anonKey } };
 }
 
@@ -3511,7 +3494,10 @@ async function runRepairLanLogin(body: DeployBody, log: (m: string) => Promise<v
     // browser path and require Auth + REST + Storage probes to pass.
     await repairLocalApiUrlOnExistingDeployment(conn, body, kongPort, anonKey, log);
     const appPort = body.app_port || "8080";
-    const proxyBase = `http://127.0.0.1:${appPort}`;
+    const repaired = (globalThis as any).__lastDeployResult || {};
+    const proxyBase = typeof repaired.url === "string" && repaired.url.startsWith("http")
+      ? repaired.url
+      : `http://127.0.0.1:${appPort}`;
     const authSettings = await exec(conn, `curl -sS -m 10 -o /tmp/sf_auth_settings.json -w "%{http_code}" ${shQuote(`${proxyBase}/auth/v1/settings`)} -H ${shQuote(`apikey: ${anonKey}`)} 2>/dev/null || true`);
     const authSettingsCode = (authSettings.stdout || "").trim();
     if (!/^2\d\d$/.test(authSettingsCode)) {
@@ -3549,7 +3535,7 @@ async function runRepairLanLogin(body: DeployBody, log: (m: string) => Promise<v
       );
     }
     await log("✓ Build LAN vérifié : client runtime, alias Vite, mode local et fichier web livré présents");
-    const publicBase = resolveBrowserAppBase(body, appPort);
+    const publicBase = proxyBase;
     await log(`✓ Correctif LAN appliqué et cache HTML désactivé. Ouvrez ${publicBase}`);
     return { action: "repair_lan_login", ok: true, url: publicBase, auth_http: authSettingsCode, login_http: realLoginCode };
   } finally {

@@ -194,14 +194,9 @@ async function prepareEarlyWebDeployment(
   log: (m: string) => Promise<void> | void,
 ) {
   const publicAppUrl = resolveBrowserAppBase(body, appPort, false);
-  // The Supabase client validates its URL synchronously. Older remote
-  // checkouts can bypass our Vite alias and pass the same-origin marker
-  // directly to createClient(), which leaves the page completely blank.
-  // Always provide a valid browser URL at build time; Nginx proxies the API
-  // paths on that same public application origin.
-  const browserSupabaseUrl = ["__SCREENFLOW_SAME_ORIGIN__", "same-origin", "runtime:same-origin"].includes(supabaseUrl)
-    ? publicAppUrl
-    : supabaseUrl;
+  // Keep the marker in the bundle: the runtime client resolves it to the
+  // browser origin, which works identically through LAN IP, hostname and WAN.
+  const browserSupabaseUrl = supabaseUrl;
   const quoteYaml = (value: string) => `'${(value || "").replace(/'/g, "''")}'`;
   const compose = `services:
   web:
@@ -437,10 +432,12 @@ function hostOf(value: string) {
 }
 
 function isLanHost(hostname: string) {
-  const host = hostname.toLowerCase();
+  const host = hostname.toLowerCase().replace(/^\\[|\\]$/g, '');
   if (!host) return false;
-  if (host === 'localhost' || host.endsWith('.local') || /^127\./.test(host)) return true;
+  if (host === 'localhost' || host.endsWith('.local') || !host.includes('.')) return true;
+  if (/^127\./.test(host) || /^169\.254\./.test(host)) return true;
   if (/^10\./.test(host) || /^192\.168\./.test(host)) return true;
+  if (host === '::1' || /^fe[89ab][0-9a-f]:/.test(host) || /^f[cd][0-9a-f]{2}:/.test(host)) return true;
   const m = host.match(/^172\.(\d{1,2})\./);
   if (!m) return false;
   const n = Number.parseInt(m[1], 10);
@@ -3427,11 +3424,20 @@ if p.exists():
     before = s
     s = s.replace('if (!runtimeOrigin || appEnv.supabaseProjectId !== "local") return false;', 'if (!runtimeOrigin) return false;')
     s = s.replace('if (appEnv.supabaseProjectId === "local" && isLocalNetworkHostname(runtimeHost) && runtimeOrigin && runtimeHost !== configuredHost) {', 'if (isLocalNetworkHostname(runtimeHost) && runtimeOrigin && runtimeHost !== configuredHost) {')
+    s = s.replace('const host = hostname.toLowerCase();', 'const host = hostname.toLowerCase().replace(/^\\\\[|\\\\]$/g, "");')
+    s = s.replace('if (host === "localhost" || host.endsWith(".local")) return true;', 'if (host === "localhost" || host.endsWith(".local") || !host.includes(".")) return true;')
+    s = s.replace('if (/^127\\./.test(host) || host === "0.0.0.0") return true;', 'if (/^127\\./.test(host) || /^169\\.254\\./.test(host) || host === "0.0.0.0") return true;')
+    ipv6 = '  if (host === "::1" || /^fe[89ab][0-9a-f]:/.test(host) || /^f[cd][0-9a-f]{2}:/.test(host)) return true;\\n'
+    anchor = '  if (/^10\\./.test(host) || /^192\\.168\\./.test(host)) return true;\\n'
+    if 'fe[89ab][0-9a-f]' not in s and anchor in s:
+        s = s.replace(anchor, anchor + ipv6, 1)
     if s != before:
         p.write_text(s)
         print('PATCHED')
-    else:
+    elif 'isLocalNetworkHostname(runtimeHost)' in s and '!host.includes(".")' in s and '169\\.254' in s and 'fe[89ab]' in s:
         print('ALREADY_OK')
+    else:
+        raise SystemExit('LAN runtime invariant missing')
 else:
     print('MISSING')
 PY`;

@@ -414,7 +414,7 @@ function buildLocalAuthUrlEnvPatch(body: DeployBody, appPort: string, publicBase
 }
 
 function buildRuntimeSupabaseClientHotfix() {
-  return `// Runtime client used by ScreenFlow SSH repair: keep backend calls on the current app origin for local LAN access.
+  return `// Runtime client used by ScreenFlow SSH repair: backend calls always stay on the current app origin.
 import { createClient } from '@supabase/supabase-js';
 import type { Database } from './types';
 
@@ -427,40 +427,22 @@ function runtimeOrigin() {
   return '';
 }
 
-function hostOf(value: string) {
-  try { return new URL(value).hostname.toLowerCase(); } catch { return ''; }
-}
-
-function isLanHost(hostname: string) {
-  const host = hostname.toLowerCase().replace(/^\\[|\\]$/g, '');
-  if (!host) return false;
-  if (host === 'localhost' || host.endsWith('.local') || !host.includes('.')) return true;
-  if (/^127\./.test(host) || /^169\.254\./.test(host)) return true;
-  if (/^10\./.test(host) || /^192\.168\./.test(host)) return true;
-  if (host === '::1' || /^fe[89ab][0-9a-f]:/.test(host) || /^f[cd][0-9a-f]{2}:/.test(host)) return true;
-  const m = host.match(/^172\.(\d{1,2})\./);
-  if (!m) return false;
-  const n = Number.parseInt(m[1], 10);
-  return n >= 16 && n <= 31;
-}
-
 function resolveSupabaseUrl() {
   const origin = runtimeOrigin();
-  // A self-hosted installation must always use the exact origin from which
-  // the browser loaded the app (LAN IP, WAN IP, hostname, HTTP or HTTPS).
-  if (origin && projectId === 'local') return origin;
   const marker = configuredUrl === '__SCREENFLOW_SAME_ORIGIN__' || configuredUrl === 'same-origin' || configuredUrl === 'runtime:same-origin';
-  if (marker && origin) return origin;
-  if (origin && isLanHost(hostOf(origin)) && hostOf(origin) !== hostOf(configuredUrl)) return origin;
-  void projectId;
+  // Self-hosted builds are deliberately origin-agnostic. This removes every
+  // dependency on the configured WAN address, NAT loopback and LAN detection.
+  if (origin && (projectId === 'local' || marker)) return origin;
   return configuredUrl;
 }
 
 export const supabase = createClient<Database>(resolveSupabaseUrl(), publishableKey, {
   auth: {
     storage: localStorage,
+    storageKey: 'screenflow-local-auth-v3',
     persistSession: true,
     autoRefreshToken: true,
+    detectSessionInUrl: true,
   },
 });
 `;
@@ -2672,36 +2654,7 @@ async function repairLocalApiUrlOnExistingDeployment(conn: Client, body: DeployB
 
   await log(`→ Réparation URL API navigateur : ${publicBase} (vérifications serveur via ${localIp})`);
 
-  const nginxConf = `client_max_body_size 1024m;
-server {
-  listen 80;
-  server_name _;
-  client_max_body_size 1024m;
-  root /usr/share/nginx/html;
-  index index.html;
-  proxy_connect_timeout 10s;
-  proxy_send_timeout 3600s;
-  proxy_read_timeout 3600s;
-  set $cors_origin $http_origin;
-  error_page 418 = @cors_preflight;
-  location @cors_preflight {
-    add_header Access-Control-Allow-Origin $cors_origin always;
-    add_header Vary Origin always;
-    add_header Access-Control-Allow-Methods "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS" always;
-    add_header Access-Control-Allow-Headers "authorization, apikey, content-type, x-client-info, x-upsert, prefer, accept-profile, content-profile, range, x-requested-with, x-supabase-api-version, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version" always;
-    add_header Access-Control-Max-Age 86400 always;
-    add_header Content-Length 0 always;
-    return 204;
-  }
-  location /auth/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/auth/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; }
-  location /rest/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/rest/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; client_max_body_size 50m; }
-  location /storage/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/storage/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; client_max_body_size 1024m; proxy_request_buffering off; proxy_buffering off; proxy_read_timeout 3600s; proxy_send_timeout 3600s; }
-  location /functions/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/functions/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; }
-  location /realtime/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/realtime/v1/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; proxy_read_timeout 3600s; proxy_send_timeout 3600s; }
-  location /assets/ { expires 1y; add_header Cache-Control "public, immutable"; }
-  location / { try_files $uri $uri/ /index.html; }
-}
-`;
+  const nginxConf = buildUploadRepairNginxConf(kongPort);
 
   await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(nginxConf));
   await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
@@ -2724,10 +2677,16 @@ else:
     s = re.sub(r"(VITE_PUBLIC_APP_URL:.*\\n)", "\\1        VITE_APP_BASE_PATH: '/'\\n", s)
 p.write_text(s)
 PY`;
-  await exec(conn, patchCompose);
+  const composePatchResult = await exec(conn, patchCompose);
+  if (composePatchResult.code !== 0) {
+    throw new Error("Impossible d'imposer le mode backend même-origine dans docker-compose.yml : " + (composePatchResult.stderr || composePatchResult.stdout).slice(-700));
+  }
   const repairAuthEnvB64 = b64utf8(buildLocalAuthUrlEnvPatch(body, appPort, publicBase));
   await exec(conn, `cd ${supaDir} && for k in SITE_URL API_EXTERNAL_URL GOTRUE_EXTERNAL_URL ADDITIONAL_REDIRECT_URLS SUPABASE_PUBLIC_URL; do sed -i "/^$k=/d" .env; done && printf '%s' '${repairAuthEnvB64}' | base64 -d >> .env && docker compose restart auth storage rest kong 2>&1 || true`);
-  await exec(conn, `cd ${repoDir} && (docker compose up -d --build web || docker-compose up -d --build web) 2>&1`);
+  const rebuild = await exec(conn, `cd ${repoDir} && (docker compose build --no-cache web && docker compose up -d --force-recreate web) 2>&1`);
+  if (rebuild.code !== 0) {
+    throw new Error("Reconstruction propre du client LAN échouée : " + (rebuild.stdout || rebuild.stderr).slice(-1800));
+  }
   await ensureLocalApiServices(conn, supaDir, kongPort, anonKey, log);
   const proxyBase = `http://127.0.0.1:${appPort}`;
   const probe = await exec(conn, `curl -sS -m 10 -o /tmp/sf_proxy_bucket.txt -w "%{http_code}" ${shQuote(`${proxyBase}/storage/v1/bucket`)} -H ${shQuote(`apikey: ${anonKey}`)} -H ${shQuote(`Authorization: Bearer ${anonKey}`)} 2>/dev/null || true`);

@@ -1,9 +1,14 @@
 import { createRoot } from "react-dom/client";
 import "./index.css";
+import App from "./App.tsx";
 import { validateLocalEnvironment } from "@/lib/env";
 
 validateLocalEnvironment();
 
-void import("./App.tsx").then(({ default: App }) => {
-  createRoot(document.getElementById("root")!).render(<App />);
-});
+const rootElement = document.getElementById("root");
+
+if (!rootElement) {
+  throw new Error("Élément racine #root introuvable.");
+}
+
+createRoot(rootElement).render(<App />);

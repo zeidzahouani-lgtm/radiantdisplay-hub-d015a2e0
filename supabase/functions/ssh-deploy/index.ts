@@ -446,6 +446,9 @@ function isLanHost(hostname: string) {
 
 function resolveSupabaseUrl() {
   const origin = runtimeOrigin();
+  // A self-hosted installation must always use the exact origin from which
+  // the browser loaded the app (LAN IP, WAN IP, hostname, HTTP or HTTPS).
+  if (origin && projectId === 'local') return origin;
   const marker = configuredUrl === '__SCREENFLOW_SAME_ORIGIN__' || configuredUrl === 'same-origin' || configuredUrl === 'runtime:same-origin';
   if (marker && origin) return origin;
   if (origin && isLanHost(hostOf(origin)) && hostOf(origin) !== hostOf(configuredUrl)) return origin;
@@ -3534,14 +3537,18 @@ async function runRepairLanLogin(body: DeployBody, log: (m: string) => Promise<v
     if (!cid) {
       throw new Error("Le conteneur web est introuvable après la réparation LAN.");
     }
-    const bundleCheck = await exec(conn, `docker exec ${cid} sh -c 'set -e; grep -R -q "__SCREENFLOW_SAME_ORIGIN__" /usr/share/nginx/html/assets; grep -R -q "location.origin" /usr/share/nginx/html/assets; if grep -R -q "const [A-Za-z0-9_$]*=\"__SCREENFLOW_SAME_ORIGIN__\".*createClient\|YTe(\"__SCREENFLOW_SAME_ORIGIN__\"" /usr/share/nginx/html/assets; then exit 12; fi' 2>&1`);
-    if (bundleCheck.code !== 0) {
+    // Validate deterministic build inputs. Searching minified JavaScript for a
+    // precise expression is unreliable because Vite/esbuild renames and folds
+    // it differently between releases. The real Auth login above is the
+    // authoritative end-to-end verification of the delivered LAN route.
+    const buildInputCheck = await exec(conn, `set -e; grep -Fq "projectId === 'local'" ${repoDir}/src/integrations/supabase/runtime-client.ts; grep -Fq 'src/integrations/supabase/runtime-client.ts' ${repoDir}/vite.config.ts; grep -Fq "VITE_SUPABASE_PROJECT_ID: 'local'" ${repoDir}/docker-compose.yml; docker exec ${cid} test -s /usr/share/nginx/html/index.html`);
+    if (buildInputCheck.code !== 0) {
       throw new Error(
-        `Le bundle web livré n'utilise pas correctement l'origine LAN (code ${bundleCheck.code}). ` +
-        "La réparation est arrêtée au lieu de signaler un faux succès.",
+        `La configuration du build LAN est incomplète (code ${buildInputCheck.code}). ` +
+        "Le client runtime, l'alias Vite ou le conteneur web est manquant.",
       );
     }
-    await log("✓ Bundle navigateur vérifié : origine LAN dynamique active dans les fichiers réellement servis");
+    await log("✓ Build LAN vérifié : client runtime, alias Vite, mode local et fichier web livré présents");
     const publicBase = resolveBrowserAppBase(body, appPort);
     await log(`✓ Correctif LAN appliqué et cache HTML désactivé. Ouvrez ${publicBase}`);
     return { action: "repair_lan_login", ok: true, url: publicBase, auth_http: authSettingsCode, login_http: realLoginCode };

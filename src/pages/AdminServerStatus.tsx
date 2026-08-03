@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
@@ -8,6 +8,8 @@ import { supabase } from "@/integrations/supabase/client";
 import { toast } from "sonner";
 import { Activity, Cpu, MemoryStick, HardDrive, Server, Container, Database, RefreshCw, Loader2, Network, Wifi, Gauge, AlertTriangle } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 
 function formatBytes(bytes: number) {
   if (!bytes) return "0 B";
@@ -51,12 +53,30 @@ export default function AdminServerStatus() {
   const [server, setServer] = useState<ServerData | null>(null);
   const [database, setDatabase] = useState<DbData | null>(null);
   const [lastFetch, setLastFetch] = useState<string | null>(null);
+  const [host, setHost] = useState(() => localStorage.getItem("server_stats_host") || "192.168.0.100");
+  const [port, setPort] = useState(() => localStorage.getItem("server_stats_port") || "22");
+  const [username, setUsername] = useState(() => localStorage.getItem("server_stats_user") || "root");
+  const [password, setPassword] = useState("");
 
   const fetchStats = useCallback(async (silent = false) => {
+    const sshPort = Number(port);
+    if (!host.trim() || !username.trim() || !password || !Number.isInteger(sshPort) || sshPort < 1 || sshPort > 65535) {
+      toast.error("Renseignez une adresse IP locale, un port SSH valide et les identifiants du serveur.");
+      return;
+    }
     setLoading(true);
     try {
+      localStorage.setItem("server_stats_host", host.trim());
+      localStorage.setItem("server_stats_port", String(sshPort));
+      localStorage.setItem("server_stats_user", username.trim());
       const { data, error } = await supabase.functions.invoke("server-stats", {
-        body: { mode: "local" },
+        body: {
+          mode: "ssh",
+          host: host.trim(),
+          port: sshPort,
+          username: username.trim(),
+          password,
+        },
       });
       if (error) throw error;
       if (!data?.success) throw new Error(data?.error || "Erreur inconnue");
@@ -69,11 +89,7 @@ export default function AdminServerStatus() {
     } finally {
       setLoading(false);
     }
-  }, []);
-
-  useEffect(() => {
-    void fetchStats(true);
-  }, [fetchStats]);
+  }, [host, password, port, username]);
 
   // Compute alerts from results
   const alerts: { level: "warning" | "critical"; title: string; message: string }[] = [];
@@ -123,16 +139,61 @@ export default function AdminServerStatus() {
         </p>
       </div>
 
-      {/* Automatic local monitoring */}
+      {/* Manual SSH monitoring */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-lg flex items-center gap-2"><Server className="h-5 w-5" />Serveur local détecté</CardTitle>
-          <CardDescription>Le serveur où ScreenFlow est installé est contrôlé automatiquement via localhost.</CardDescription>
+          <CardTitle className="text-lg flex items-center gap-2"><Server className="h-5 w-5" />Connexion au serveur local</CardTitle>
+          <CardDescription>Utilisez l'adresse IP LAN et les identifiants SSH du serveur où ScreenFlow est installé.</CardDescription>
         </CardHeader>
-        <CardContent>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-12">
+            <div className="space-y-2 md:col-span-5">
+              <Label htmlFor="server-host">Adresse IP locale</Label>
+              <Input
+                id="server-host"
+                value={host}
+                onChange={(event) => setHost(event.target.value)}
+                placeholder="ex: 192.168.0.x"
+                autoComplete="off"
+              />
+            </div>
+            <div className="space-y-2 md:col-span-2">
+              <Label htmlFor="server-port">Port SSH</Label>
+              <Input
+                id="server-port"
+                type="number"
+                min={1}
+                max={65535}
+                value={port}
+                onChange={(event) => setPort(event.target.value)}
+                placeholder="22"
+              />
+            </div>
+            <div className="space-y-2 md:col-span-5">
+              <Label htmlFor="server-username">Identifiant SSH</Label>
+              <Input
+                id="server-username"
+                value={username}
+                onChange={(event) => setUsername(event.target.value)}
+                placeholder="root"
+                autoComplete="username"
+              />
+            </div>
+            <div className="space-y-2 md:col-span-12">
+              <Label htmlFor="server-password">Mot de passe SSH</Label>
+              <Input
+                id="server-password"
+                type="password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                placeholder="Mot de passe du serveur"
+                autoComplete="current-password"
+              />
+            </div>
+          </div>
           <div className="flex items-center gap-3">
             <Button onClick={() => void fetchStats(false)} disabled={loading} className="gap-2">
-              {loading ? <><Loader2 className="h-4 w-4 animate-spin" />Récupération…</> : <><RefreshCw className="h-4 w-4" />Actualiser</>}
+              {loading ? <><Loader2 className="h-4 w-4 animate-spin" />Connexion…</> : <><RefreshCw className="h-4 w-4" />Tester et actualiser</>}
             </Button>
             {lastFetch && <span className="text-xs text-muted-foreground">Dernière mise à jour: {lastFetch}</span>}
           </div>

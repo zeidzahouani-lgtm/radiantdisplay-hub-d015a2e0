@@ -482,7 +482,13 @@ if 'src/integrations/supabase/runtime-client.ts' not in s:
     p.write_text(s)
 print('OK')
 PY`;
-  await exec(conn, vitePatch);
+  const result = await exec(conn, vitePatch);
+  if (result.code !== 0 || !(result.stdout || "").includes("OK")) {
+    throw new Error(
+      "Impossible d'activer le client backend runtime pour le LAN : " +
+      (result.stderr || result.stdout || "alias Vite introuvable").slice(-700),
+    );
+  }
   await log("✓ Client backend runtime ajouté : accès local LAN → appels API sur la même adresse");
 }
 
@@ -2763,7 +2769,8 @@ server {
   location /functions/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/functions/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; }
   location /realtime/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/realtime/v1/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; proxy_read_timeout 3600s; proxy_send_timeout 3600s; }
   location /assets/ { expires 1y; add_header Cache-Control "public, immutable"; }
-  location / { try_files $uri $uri/ /index.html; }
+  location = /index.html { add_header Cache-Control "no-store, no-cache, must-revalidate" always; expires -1; }
+  location / { add_header Cache-Control "no-cache" always; try_files $uri $uri/ /index.html; }
 }
 `;
 }
@@ -3464,6 +3471,7 @@ async function runRepairLanLogin(body: DeployBody, log: (m: string) => Promise<v
     await log("✓ SSH connecté");
     const pull = await exec(conn, `cd ${repoDir} && (git fetch --all --prune && git reset --hard @{u}) 2>&1 | tail -n 5`);
     await log(`→ Dépôt distant synchronisé${pull.code === 0 ? "" : " (git indisponible, patch local appliqué)"}`);
+    await patchRemoteBuildEntrypoint(conn, repoDir, log);
     await patchRemoteLanOriginFallback(conn, repoDir, log);
     await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
     const kongPort = await readRemoteEnv(conn, `${supaDir}/.env`, "KONG_HTTP_PORT")
@@ -3476,6 +3484,19 @@ async function runRepairLanLogin(body: DeployBody, log: (m: string) => Promise<v
     if (!anonKey) {
       throw new Error("ANON_KEY locale introuvable : impossible de réparer et vérifier le login LAN.");
     }
+
+    const serviceKey = await readRemoteEnv(conn, `${supaDir}/.env`, "SERVICE_ROLE_KEY")
+      || await readRemoteEnv(conn, `${supaDir}/.env`, "SUPABASE_SECRET_KEY")
+      || "";
+    if (!serviceKey) {
+      throw new Error("Clé d'administration locale introuvable : impossible de réparer le compte admin avant le test LAN.");
+    }
+
+    await log("→ Réparation du compte admin local et de ses droits globaux…");
+    await ensurePostgresSqlAccess(conn, supaDir, log);
+    await ensureLocalAuthGateway(conn, supaDir, kongPort, log);
+    await upsertDefaultAdminViaAuthApi(conn, supaDir, kongPort, serviceKey, DEFAULT_ADMIN_PASSWORD, log);
+    await ensureDefaultAdminRole(conn, supaDir, log);
 
     // Keep the local backend functions aligned with the repaired frontend and
     // provision the passwordless localhost-only server diagnostics at once.
@@ -3502,9 +3523,28 @@ async function runRepairLanLogin(body: DeployBody, log: (m: string) => Promise<v
       throw new Error(`Le endpoint de login LAN ne répond pas correctement (HTTP ${authTokenCode || "000"})${detail.stdout ? ` : ${detail.stdout.trim()}` : ""}`);
     }
     await log(`✓ Test réel du endpoint login LAN réussi : HTTP ${authTokenCode} (identifiants de test volontairement invalides)`);
+    const realLogin = await exec(conn, `curl -sS -m 15 -o /tmp/sf_auth_real_login.json -w "%{http_code}" -X POST ${shQuote(`${proxyBase}/auth/v1/token?grant_type=password`)} -H ${shQuote(`apikey: ${anonKey}`)} -H ${shQuote(`Authorization: Bearer ${anonKey}`)} -H 'Content-Type: application/json' --data ${shQuote(JSON.stringify({ email: DEFAULT_ADMIN_EMAIL, password: DEFAULT_ADMIN_PASSWORD }))} 2>/dev/null || true`);
+    const realLoginCode = (realLogin.stdout || "").trim();
+    if (realLoginCode !== "200") {
+      const detail = await exec(conn, `tail -c 700 /tmp/sf_auth_real_login.json 2>/dev/null || true`);
+      throw new Error(`Le vrai login admin via l'adresse LAN échoue encore (HTTP ${realLoginCode || "000"})${detail.stdout ? ` : ${detail.stdout.trim()}` : ""}`);
+    }
+    await log(`✓ Connexion admin réelle validée de bout en bout via le proxy LAN (HTTP ${realLoginCode})`);
+    const cid = (await exec(conn, `cd ${repoDir} && (docker compose ps -q web || docker-compose ps -q web) 2>/dev/null | head -1`)).stdout.trim();
+    if (!cid) {
+      throw new Error("Le conteneur web est introuvable après la réparation LAN.");
+    }
+    const bundleCheck = await exec(conn, `docker exec ${cid} sh -c 'set -e; grep -R -q "__SCREENFLOW_SAME_ORIGIN__" /usr/share/nginx/html/assets; grep -R -q "location.origin" /usr/share/nginx/html/assets; if grep -R -q "const [A-Za-z0-9_$]*=\"__SCREENFLOW_SAME_ORIGIN__\".*createClient\|YTe(\"__SCREENFLOW_SAME_ORIGIN__\"" /usr/share/nginx/html/assets; then exit 12; fi' 2>&1`);
+    if (bundleCheck.code !== 0) {
+      throw new Error(
+        `Le bundle web livré n'utilise pas correctement l'origine LAN (code ${bundleCheck.code}). ` +
+        "La réparation est arrêtée au lieu de signaler un faux succès.",
+      );
+    }
+    await log("✓ Bundle navigateur vérifié : origine LAN dynamique active dans les fichiers réellement servis");
     const publicBase = resolveBrowserAppBase(body, appPort);
-    await log(`✓ Correctif définitif appliqué. Videz l'ancien cache du navigateur puis ouvrez ${publicBase}`);
-    return { action: "repair_lan_login", ok: true, url: publicBase, auth_http: authSettingsCode, login_http: authTokenCode };
+    await log(`✓ Correctif LAN appliqué et cache HTML désactivé. Ouvrez ${publicBase}`);
+    return { action: "repair_lan_login", ok: true, url: publicBase, auth_http: authSettingsCode, login_http: realLoginCode };
   } finally {
     try { conn.end(); } catch { /* ignore */ }
   }

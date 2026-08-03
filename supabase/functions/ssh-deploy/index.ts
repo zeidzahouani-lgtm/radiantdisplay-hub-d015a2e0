@@ -3432,6 +3432,7 @@ async function runRepairLanLogin(body: DeployBody, log: (m: string) => Promise<v
   const port = body.port ?? 22;
   const remoteDir = body.remote_dir || "/opt/screenflow";
   const repoDir = `${remoteDir}/repo`;
+  const supaDir = `${remoteDir}/supabase`;
   await log("→ Correctif login LAN : les appels Auth/REST/Storage doivent rester sur l'origine du navigateur");
   await log(`→ Connexion SSH ${body.username}@${body.host}:${port}…`);
   const conn = await ssh({ host: body.host, port, username: body.username, password: body.password });
@@ -3441,16 +3442,37 @@ async function runRepairLanLogin(body: DeployBody, log: (m: string) => Promise<v
     await log(`→ Dépôt distant synchronisé${pull.code === 0 ? "" : " (git indisponible, patch local appliqué)"}`);
     await patchRemoteLanOriginFallback(conn, repoDir, log);
     await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
+    const kongPort = await readRemoteEnv(conn, `${supaDir}/.env`, "KONG_HTTP_PORT")
+      || body.supabase_kong_http_port
+      || "8000";
+    const anonKey = await readRemoteEnv(conn, `${supaDir}/.env`, "ANON_KEY")
+      || await readRemoteEnv(conn, `${supaDir}/.env`, "SUPABASE_PUBLISHABLE_KEY")
+      || body.vite_supabase_key
+      || "";
+    if (!anonKey) {
+      throw new Error("ANON_KEY locale introuvable : impossible de réparer et vérifier le login LAN.");
+    }
+
+    // The previous implementation only rebuilt the frontend. That leaves an
+    // old/missing same-origin Nginx proxy untouched, so the browser resolves
+    // the correct LAN URL but Auth still cannot be reached. Repair the entire
+    // browser path and require Auth + REST + Storage probes to pass.
+    await repairLocalApiUrlOnExistingDeployment(conn, body, kongPort, anonKey, log);
+    const appPort = body.app_port || "8080";
+    const proxyBase = `http://127.0.0.1:${appPort}`;
+    const authSettings = await exec(conn, `curl -sS -m 10 -o /tmp/sf_auth_settings.json -w "%{http_code}" ${shQuote(`${proxyBase}/auth/v1/settings`)} -H ${shQuote(`apikey: ${anonKey}`)} 2>/dev/null || true`);
+    const authSettingsCode = (authSettings.stdout || "").trim();
+    if (!/^2\d\d$/.test(authSettingsCode)) {
+      const detail = await exec(conn, `tail -c 500 /tmp/sf_auth_settings.json 2>/dev/null || true`);
+      throw new Error(`Auth LAN reste inaccessible via le conteneur web (HTTP ${authSettingsCode || "000"})${detail.stdout ? ` : ${detail.stdout.trim()}` : ""}`);
+    }
+    await log(`✓ Test final Auth LAN réussi : ${proxyBase}/auth/v1/settings → HTTP ${authSettingsCode}`);
+    const publicBase = resolveBrowserAppBase(body, appPort);
+    await log(`✓ Correctif définitif appliqué. Videz l'ancien cache du navigateur puis ouvrez ${publicBase}`);
+    return { action: "repair_lan_login", ok: true, url: publicBase, auth_http: authSettingsCode };
   } finally {
     try { conn.end(); } catch { /* ignore */ }
   }
-  await log("→ Reconstruction du conteneur web pour appliquer le correctif…");
-  const rebuilt = await runRepairWebContainer(body, log);
-  const ok = !rebuilt || rebuilt.ok !== false;
-  if (ok) {
-    await log("✓ Correctif appliqué : reconnectez-vous via l'IP LAN du serveur");
-  }
-  return { ...(rebuilt || {}), action: "repair_lan_login", ok, web_rebuild: rebuilt };
 }
 
 async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promise<void> | void) {

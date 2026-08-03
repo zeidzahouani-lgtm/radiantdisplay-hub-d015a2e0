@@ -451,7 +451,8 @@ function resolveSupabaseUrl() {
   const origin = runtimeOrigin();
   const marker = configuredUrl === '__SCREENFLOW_SAME_ORIGIN__' || configuredUrl === 'same-origin' || configuredUrl === 'runtime:same-origin';
   if (marker && origin) return origin;
-  if (projectId === 'local' && origin && isLanHost(hostOf(origin)) && hostOf(origin) !== hostOf(configuredUrl)) return origin;
+  if (origin && isLanHost(hostOf(origin)) && hostOf(origin) !== hostOf(configuredUrl)) return origin;
+  void projectId;
   return configuredUrl;
 }
 

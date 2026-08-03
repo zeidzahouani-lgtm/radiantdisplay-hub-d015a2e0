@@ -66,11 +66,15 @@ function isLocalNetworkHostname(hostname: string) {
 function shouldUseRuntimeOrigin(configuredUrl: string) {
   if (isSameOriginSupabaseMarker(configuredUrl)) return true;
   const runtimeOrigin = getRuntimeOrigin();
-  if (!runtimeOrigin || appEnv.supabaseProjectId !== "local") return false;
+  if (!runtimeOrigin) return false;
   const runtimeHost = hostnameFromUrl(runtimeOrigin);
   const configuredHost = hostnameFromUrl(configuredUrl);
+  // Servi depuis une adresse LAN : le proxy Nginx expose l'API sur la même
+  // origine. On ignore l'URL publique (WAN) buildée, car le NAT loopback
+  // échoue presque toujours depuis le réseau interne.
   return isLocalNetworkHostname(runtimeHost) && runtimeHost !== configuredHost;
 }
+
 
 export function getSupabaseUrl() {
   const configured = appEnv.supabaseUrl;

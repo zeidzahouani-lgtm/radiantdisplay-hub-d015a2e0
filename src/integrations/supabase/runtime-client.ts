@@ -8,7 +8,9 @@ const SUPABASE_PUBLISHABLE_KEY = getSupabasePublishableKey();
 export const supabase = createClient<Database>(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
   auth: {
     storage: localStorage,
+    storageKey: 'screenflow-local-auth-v3',
     persistSession: true,
     autoRefreshToken: true,
+    detectSessionInUrl: true,
   },
 });

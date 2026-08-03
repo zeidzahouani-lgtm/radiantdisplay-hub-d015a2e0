@@ -2702,7 +2702,7 @@ p = pathlib.Path(${JSON.stringify(`${repoDir}/docker-compose.yml`)})
 s = p.read_text()
 url = base64.b64decode(${JSON.stringify(b64utf8(publicBase))}).decode()
 key = base64.b64decode(${JSON.stringify(b64utf8(anonKey))}).decode()
-s = re.sub(r"VITE_SUPABASE_URL:\\s*.*", f"VITE_SUPABASE_URL: '{url}'", s)
+s = re.sub(r"VITE_SUPABASE_URL:\\s*.*", "VITE_SUPABASE_URL: '__SCREENFLOW_SAME_ORIGIN__'", s)
 s = re.sub(r"VITE_SUPABASE_PUBLISHABLE_KEY:\\s*.*", f"VITE_SUPABASE_PUBLISHABLE_KEY: '{key}'", s)
 s = re.sub(r"VITE_SUPABASE_PROJECT_ID:\\s*.*", "VITE_SUPABASE_PROJECT_ID: 'local'", s)
 if re.search(r"VITE_PUBLIC_APP_URL:\\s*", s):
@@ -3545,7 +3545,7 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
     build:
       context: .
       args:
-        VITE_SUPABASE_URL: ${quoteYaml(publicBase)}
+        VITE_SUPABASE_URL: '__SCREENFLOW_SAME_ORIGIN__'
         VITE_SUPABASE_PUBLISHABLE_KEY: ${quoteYaml(anonKey)}
         VITE_SUPABASE_PROJECT_ID: ${quoteYaml(projectId)}
         VITE_PUBLIC_APP_URL: ${quoteYaml(publicBase)}

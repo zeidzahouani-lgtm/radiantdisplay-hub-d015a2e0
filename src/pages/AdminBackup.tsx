@@ -181,7 +181,7 @@ export default function AdminBackup() {
 
   // SSH Deploy state
   const [sshHost, setSshHost] = useState("");
-  const [sshLocalIp, setSshLocalIp] = useState("127.0.0.1");
+  const [sshLocalIp, setSshLocalIp] = useState("");
   const [sshPort, setSshPort] = useState("22");
   const [sshUser, setSshUser] = useState("root");
   const [sshPassword, setSshPassword] = useState("");
@@ -1202,8 +1202,15 @@ To rebuild manually: docker compose up -d --build
 
   const handleRepairLanLogin = () =>
     runSshAction("repair_lan_login", {}, {
-      initialLog: "🌐 Correctif login LAN : bascule des appels API sur l'origine du navigateur…",
+      initialLog: "🌐 Correctif radical LAN : détection IP privée, rebuild propre et test du vrai login…",
       successMessage: "Correctif login LAN appliqué ✓",
+      onResult: (r) => {
+        if (!r?.url) return;
+        const repairedUrl = new URL(r.url);
+        setSshLocalIp(repairedUrl.hostname);
+        setSshDeployedUrl(r.url);
+        persistSshConfig({ sshLocalIp: repairedUrl.hostname, sshDeployedUrl: r.url });
+      },
     });
 
   const handleRepairApiUrl = () =>
@@ -1883,7 +1890,7 @@ To rebuild manually: docker compose up -d --build
                 </div>
                 <div className="space-y-2">
                   <Label className="flex items-center gap-2"><Server className="h-3.5 w-3.5" />Adresse IP locale du serveur</Label>
-                  <Input value={sshLocalIp} onChange={e => setSshLocalIp(e.target.value)} placeholder="127.0.0.1" disabled={sshDeploying} />
+                  <Input value={sshLocalIp} onChange={e => setSshLocalIp(e.target.value)} placeholder="192.168.0.25 (vide = détection automatique)" disabled={sshDeploying} />
                   <p className="text-[11px] text-muted-foreground">Utilisée pour les vérifications internes et la connexion à la base de données depuis le serveur (par défaut <code>127.0.0.1</code>).</p>
                 </div>
                 <div className="space-y-2">

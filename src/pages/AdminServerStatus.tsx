@@ -53,9 +53,9 @@ export default function AdminServerStatus() {
   const [server, setServer] = useState<ServerData | null>(null);
   const [database, setDatabase] = useState<DbData | null>(null);
   const [lastFetch, setLastFetch] = useState<string | null>(null);
-  const [host, setHost] = useState("192.168.0.100");
-  const [port, setPort] = useState("22");
-  const [username, setUsername] = useState("root");
+  const [host, setHost] = useState(() => localStorage.getItem("server_stats_host") || "192.168.0.100");
+  const [port, setPort] = useState(() => localStorage.getItem("server_stats_port") || "22");
+  const [username, setUsername] = useState(() => localStorage.getItem("server_stats_user") || "root");
   const [password, setPassword] = useState("");
 
   const fetchStats = useCallback(async (silent = false) => {
@@ -66,6 +66,9 @@ export default function AdminServerStatus() {
     }
     setLoading(true);
     try {
+      localStorage.setItem("server_stats_host", host.trim());
+      localStorage.setItem("server_stats_port", String(sshPort));
+      localStorage.setItem("server_stats_user", username.trim());
       const { data, error } = await supabase.functions.invoke("server-stats", {
         body: {
           mode: "ssh",

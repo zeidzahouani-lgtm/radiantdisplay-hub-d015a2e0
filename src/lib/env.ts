@@ -115,7 +115,7 @@ export function getPublicAppUrl() {
   const runtimeHost = hostnameFromUrl(runtimeOrigin);
   const configuredHost = hostnameFromUrl(appEnv.publicAppUrl);
 
-  if (appEnv.supabaseProjectId === "local" && isLocalNetworkHostname(runtimeHost) && runtimeOrigin && runtimeHost !== configuredHost) {
+  if (isLocalNetworkHostname(runtimeHost) && runtimeOrigin && runtimeHost !== configuredHost) {
     return runtimeOrigin;
   }
 

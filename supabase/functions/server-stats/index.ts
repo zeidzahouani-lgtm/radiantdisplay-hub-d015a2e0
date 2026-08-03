@@ -62,7 +62,11 @@ Deno.serve(async (req) => {
 
     const body = (await req.json().catch(() => ({}))) as StatsBody;
     const localMode = body.mode === "local";
-    const serverHost = (body.host && body.host.trim()) || Deno.env.get("SERVER_STATS_HOST") || (localMode ? "host.docker.internal" : "");
+    let bundledLocalHost = "";
+    if (localMode) {
+      try { bundledLocalHost = (await Deno.readTextFile(new URL("./.local_host", import.meta.url))).trim(); } catch { /* optional */ }
+    }
+    const serverHost = (body.host && body.host.trim()) || Deno.env.get("SERVER_STATS_HOST") || bundledLocalHost || (localMode ? "host.docker.internal" : "");
     const username = (body.username && body.username.trim()) || Deno.env.get("SERVER_STATS_USERNAME") || (localMode ? "root" : "");
     const password = body.password || Deno.env.get("SERVER_STATS_PASSWORD") || "";
     let privateKey = Deno.env.get("SERVER_STATS_PRIVATE_KEY") || "";

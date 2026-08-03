@@ -1374,6 +1374,7 @@ cd ${supaDir}
 CID=$(docker compose ps -q functions 2>/dev/null || docker compose ps -q edge-runtime 2>/dev/null || true)
 GW=$(docker inspect "$CID" --format '{{range .NetworkSettings.Networks}}{{println .Gateway}}{{end}}' 2>/dev/null | awk 'NF{print; exit}')
 [ -n "$GW" ] || GW=host.docker.internal
+printf '%s\n' "$GW" > "$KEY_DIR/.local_host"
 for k in SERVER_STATS_HOST SERVER_STATS_USERNAME; do sed -i "/^$k=/d" .env; done
 printf 'SERVER_STATS_HOST=%s\nSERVER_STATS_USERNAME=root\n' "$GW" >> .env
 (docker compose up -d --force-recreate functions 2>&1 || docker compose up -d --force-recreate edge-runtime 2>&1 || true)`);

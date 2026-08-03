@@ -474,9 +474,9 @@ if 'src/integrations/supabase/runtime-client.ts' not in s:
     object_anchor = 'alias: {'
     src_alias = '"@": path.resolve(__dirname, "./src"),'
     if object_anchor in s and src_alias in s:
-        s = s.replace(src_alias, '"@/integrations/supabase/client": path.resolve(__dirname, "./src/integrations/supabase/runtime-client.ts"),\n        ' + src_alias, 1)
+        s = s.replace(src_alias, '"@/integrations/supabase/client": path.resolve(__dirname, "./src/integrations/supabase/runtime-client.ts"),\\n        ' + src_alias, 1)
     elif 'alias: [' in s:
-        s = s.replace('alias: [', 'alias: [\n        { find: "@/integrations/supabase/client", replacement: path.resolve(__dirname, "./src/integrations/supabase/runtime-client.ts") },', 1)
+        s = s.replace('alias: [', 'alias: [\\n        { find: "@/integrations/supabase/client", replacement: path.resolve(__dirname, "./src/integrations/supabase/runtime-client.ts") },', 1)
     else:
         raise SystemExit('vite alias block not found')
     p.write_text(s)

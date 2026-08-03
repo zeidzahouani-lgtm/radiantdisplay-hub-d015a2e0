@@ -2618,7 +2618,6 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
               DEFAULT_ADMIN_EMAIL,
               DEFAULT_ADMIN_PASSWORD,
               log,
-              buildDirectKongAuthLoginCommand(supaDir, supabaseAnonOverride, DEFAULT_ADMIN_EMAIL, DEFAULT_ADMIN_PASSWORD),
             );
             connectivity.auth_login = { ok: true, detail: `Login admin OK via le proxy web ${loginProxyBase}` };
           } catch (authErr: any) {

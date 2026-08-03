@@ -217,6 +217,7 @@ async function prepareEarlyWebDeployment(
 `;
   await uploadFile(conn, `${repoDir}/docker-compose.yml`, Buffer.from(compose));
   await patchRemoteBuildEntrypoint(conn, repoDir, log);
+  await patchRemoteLanOriginFallback(conn, repoDir, log);
   await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
 
   // A remote branch (or a shallow/partial clone) may not ship nginx.conf.
@@ -2446,7 +2447,14 @@ ${portsBlock}
       await uploadFile(conn, `${remoteDir}/repo/Dockerfile`, Buffer.from(dockerfile));
       await uploadFile(conn, `${remoteDir}/repo/nginx.conf`, Buffer.from(nginxConf));
       await uploadFile(conn, `${remoteDir}/repo/docker-compose.yml`, Buffer.from(compose));
+      await patchRemoteLanOriginFallback(conn, `${remoteDir}/repo`, log);
       await patchRemoteRuntimeSupabaseClient(conn, `${remoteDir}/repo`, log);
+      if (installSupabase) {
+        const buildInputCheck = await exec(conn, `set -e; grep -Fq "projectId === 'local'" ${remoteDir}/repo/src/integrations/supabase/runtime-client.ts; grep -Fq 'src/integrations/supabase/runtime-client.ts' ${remoteDir}/repo/vite.config.ts; grep -Fq "VITE_SUPABASE_URL: '__SCREENFLOW_SAME_ORIGIN__'" ${remoteDir}/repo/docker-compose.yml; grep -Fq "VITE_SUPABASE_PROJECT_ID: 'local'" ${remoteDir}/repo/docker-compose.yml`);
+        if (buildInputCheck.code !== 0) {
+          throw new Error("Les invariants du client LAN sont absents des fichiers de build du premier déploiement.");
+        }
+      }
       log("✓ Build files ready");
 
       if (enableHttps) {
@@ -2569,7 +2577,7 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
       // same-origin proxy. Validate that exact route before declaring success.
       const proxyBase = localAppUrl;
       const proxyRest = await exec(conn, `curl -k -sS -m 10 -o /dev/null -w "%{http_code}" ${shQuote(`${proxyBase}/rest/v1/`)} -H ${shQuote(`apikey: ${supabaseAnonOverride}`)} -H ${shQuote(`Authorization: Bearer ${supabaseAnonOverride}`)} 2>/dev/null || true`);
-      const proxyAuth = await exec(conn, `curl -k -sS -m 10 -o /dev/null -w "%{http_code}" ${shQuote(`${proxyBase}/auth/v1/health`)} -H ${shQuote(`apikey: ${supabaseAnonOverride}`)} 2>/dev/null || true`);
+      const proxyAuth = await exec(conn, `curl -k -sS -m 10 -D /tmp/sf_initial_lan_auth_headers.txt -o /dev/null -w "%{http_code}" ${shQuote(`${proxyBase}/auth/v1/health`)} -H ${shQuote(`Origin: ${proxyBase}`)} -H ${shQuote(`apikey: ${supabaseAnonOverride}`)} 2>/dev/null || true`);
       const proxyStorage = await exec(conn, `curl -k -sS -m 10 -o /dev/null -w "%{http_code}" ${shQuote(`${proxyBase}/storage/v1/bucket`)} -H ${shQuote(`apikey: ${supabaseAnonOverride}`)} -H ${shQuote(`Authorization: Bearer ${supabaseAnonOverride}`)} 2>/dev/null || true`);
       const proxyRestCode = (proxyRest.stdout || "").trim();
       const proxyAuthCode = (proxyAuth.stdout || "").trim();
@@ -2583,6 +2591,11 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
         const webLogs = await exec(conn, `cd ${remoteDir}/repo && docker compose logs --tail=100 web 2>&1 || true`);
         throw new Error(`Le backend direct répond, mais le proxy web utilisé par le navigateur est invalide (${connectivity.web_proxy.detail}). ${(`${webLogs.stdout}${webLogs.stderr}`).slice(-1800)}`);
       }
+      const corsProbe = await exec(conn, `grep -Fqi ${shQuote(`Access-Control-Allow-Origin: ${proxyBase}`)} /tmp/sf_initial_lan_auth_headers.txt`);
+      if (corsProbe.code !== 0) {
+        throw new Error(`Le proxy répond via le LAN mais ses en-têtes CORS n'autorisent pas l'origine navigateur ${proxyBase}.`);
+      }
+      await log(`  • CORS navigateur : ✓ origine LAN ${proxyBase} autorisée`);
     }
 
     if (installPostgresOnly) {

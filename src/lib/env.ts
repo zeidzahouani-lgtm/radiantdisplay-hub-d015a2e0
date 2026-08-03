@@ -50,11 +50,12 @@ function hostnameFromUrl(value: string) {
 }
 
 function isLocalNetworkHostname(hostname: string) {
-  const host = hostname.toLowerCase();
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
   if (!host) return false;
-  if (host === "localhost" || host.endsWith(".local")) return true;
-  if (/^127\./.test(host) || host === "0.0.0.0") return true;
+  if (host === "localhost" || host.endsWith(".local") || !host.includes(".")) return true;
+  if (/^127\./.test(host) || /^169\.254\./.test(host) || host === "0.0.0.0") return true;
   if (/^10\./.test(host) || /^192\.168\./.test(host)) return true;
+  if (host === "::1" || /^fe[89ab][0-9a-f]:/.test(host) || /^f[cd][0-9a-f]{2}:/.test(host)) return true;
   const match172 = host.match(/^172\.(\d{1,2})\./);
   if (match172) {
     const second = Number.parseInt(match172[1], 10);

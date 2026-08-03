@@ -194,14 +194,9 @@ async function prepareEarlyWebDeployment(
   log: (m: string) => Promise<void> | void,
 ) {
   const publicAppUrl = resolveBrowserAppBase(body, appPort, false);
-  // The Supabase client validates its URL synchronously. Older remote
-  // checkouts can bypass our Vite alias and pass the same-origin marker
-  // directly to createClient(), which leaves the page completely blank.
-  // Always provide a valid browser URL at build time; Nginx proxies the API
-  // paths on that same public application origin.
-  const browserSupabaseUrl = ["__SCREENFLOW_SAME_ORIGIN__", "same-origin", "runtime:same-origin"].includes(supabaseUrl)
-    ? publicAppUrl
-    : supabaseUrl;
+  // Keep the marker in the bundle: the runtime client resolves it to the
+  // browser origin, which works identically through LAN IP, hostname and WAN.
+  const browserSupabaseUrl = supabaseUrl;
   const quoteYaml = (value: string) => `'${(value || "").replace(/'/g, "''")}'`;
   const compose = `services:
   web:
@@ -437,10 +432,12 @@ function hostOf(value: string) {
 }
 
 function isLanHost(hostname: string) {
-  const host = hostname.toLowerCase();
+  const host = hostname.toLowerCase().replace(/^\\[|\\]$/g, '');
   if (!host) return false;
-  if (host === 'localhost' || host.endsWith('.local') || /^127\./.test(host)) return true;
+  if (host === 'localhost' || host.endsWith('.local') || !host.includes('.')) return true;
+  if (/^127\./.test(host) || /^169\.254\./.test(host)) return true;
   if (/^10\./.test(host) || /^192\.168\./.test(host)) return true;
+  if (host === '::1' || /^fe[89ab][0-9a-f]:/.test(host) || /^f[cd][0-9a-f]{2}:/.test(host)) return true;
   const m = host.match(/^172\.(\d{1,2})\./);
   if (!m) return false;
   const n = Number.parseInt(m[1], 10);
@@ -1362,6 +1359,24 @@ async function syncLocalEdgeFunctions(conn: Client, remoteDir: string, supaDir: 
     `(docker compose restart functions 2>&1 || docker compose restart edge-runtime 2>&1 || true)`;
   const result = await exec(conn, cmd);
   await log((`${result.stdout}${result.stderr}`).slice(-1200));
+  const autoStats = await exec(conn, `set -e
+KEY_DIR=${shQuote(`${supaDir}/volumes/functions/server-stats`)}
+mkdir -p "$KEY_DIR" /root/.ssh
+if [ ! -s "$KEY_DIR/.local_id_ed25519" ]; then ssh-keygen -q -t ed25519 -N '' -C screenflow-local-stats -f "$KEY_DIR/.local_id_ed25519"; fi
+touch /root/.ssh/authorized_keys
+PUB=$(cat "$KEY_DIR/.local_id_ed25519.pub")
+grep -qxF "$PUB" /root/.ssh/authorized_keys || printf '%s\n' "$PUB" >> /root/.ssh/authorized_keys
+chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys "$KEY_DIR/.local_id_ed25519"
+cd ${supaDir}
+CID=$(docker compose ps -q functions 2>/dev/null || docker compose ps -q edge-runtime 2>/dev/null || true)
+GW=$(docker inspect "$CID" --format '{{range .NetworkSettings.Networks}}{{println .Gateway}}{{end}}' 2>/dev/null | awk 'NF{print; exit}')
+[ -n "$GW" ] || GW=host.docker.internal
+printf '%s\n' "$GW" > "$KEY_DIR/.local_host"
+for k in SERVER_STATS_HOST SERVER_STATS_USERNAME; do sed -i "/^$k=/d" .env; done
+printf 'SERVER_STATS_HOST=%s\nSERVER_STATS_USERNAME=root\n' "$GW" >> .env
+(docker compose up -d --force-recreate functions 2>&1 || docker compose up -d --force-recreate edge-runtime 2>&1 || true)`);
+  if (autoStats.code === 0) await log("✓ Diagnostic serveur automatique localhost configuré (clé SSH locale dédiée)");
+  else await log(`⚠ Configuration du diagnostic automatique incomplète : ${(`${autoStats.stdout}${autoStats.stderr}`).slice(-500)}`);
   await log("✓ Fonctions backend locales synchronisées");
 }
 
@@ -2687,7 +2702,7 @@ p = pathlib.Path(${JSON.stringify(`${repoDir}/docker-compose.yml`)})
 s = p.read_text()
 url = base64.b64decode(${JSON.stringify(b64utf8(publicBase))}).decode()
 key = base64.b64decode(${JSON.stringify(b64utf8(anonKey))}).decode()
-s = re.sub(r"VITE_SUPABASE_URL:\\s*.*", f"VITE_SUPABASE_URL: '{url}'", s)
+s = re.sub(r"VITE_SUPABASE_URL:\\s*.*", "VITE_SUPABASE_URL: '__SCREENFLOW_SAME_ORIGIN__'", s)
 s = re.sub(r"VITE_SUPABASE_PUBLISHABLE_KEY:\\s*.*", f"VITE_SUPABASE_PUBLISHABLE_KEY: '{key}'", s)
 s = re.sub(r"VITE_SUPABASE_PROJECT_ID:\\s*.*", "VITE_SUPABASE_PROJECT_ID: 'local'", s)
 if re.search(r"VITE_PUBLIC_APP_URL:\\s*", s):
@@ -3409,11 +3424,20 @@ if p.exists():
     before = s
     s = s.replace('if (!runtimeOrigin || appEnv.supabaseProjectId !== "local") return false;', 'if (!runtimeOrigin) return false;')
     s = s.replace('if (appEnv.supabaseProjectId === "local" && isLocalNetworkHostname(runtimeHost) && runtimeOrigin && runtimeHost !== configuredHost) {', 'if (isLocalNetworkHostname(runtimeHost) && runtimeOrigin && runtimeHost !== configuredHost) {')
+    s = s.replace('const host = hostname.toLowerCase();', 'const host = hostname.toLowerCase().replace(/^\\\\[|\\\\]$/g, "");')
+    s = s.replace('if (host === "localhost" || host.endsWith(".local")) return true;', 'if (host === "localhost" || host.endsWith(".local") || !host.includes(".")) return true;')
+    s = s.replace('if (/^127\\./.test(host) || host === "0.0.0.0") return true;', 'if (/^127\\./.test(host) || /^169\\.254\\./.test(host) || host === "0.0.0.0") return true;')
+    ipv6 = '  if (host === "::1" || /^fe[89ab][0-9a-f]:/.test(host) || /^f[cd][0-9a-f]{2}:/.test(host)) return true;\\n'
+    anchor = '  if (/^10\\./.test(host) || /^192\\.168\\./.test(host)) return true;\\n'
+    if 'fe[89ab][0-9a-f]' not in s and anchor in s:
+        s = s.replace(anchor, anchor + ipv6, 1)
     if s != before:
         p.write_text(s)
         print('PATCHED')
-    else:
+    elif 'isLocalNetworkHostname(runtimeHost)' in s and '!host.includes(".")' in s and '169\\.254' in s and 'fe[89ab]' in s:
         print('ALREADY_OK')
+    else:
+        raise SystemExit('LAN runtime invariant missing')
 else:
     print('MISSING')
 PY`;
@@ -3453,6 +3477,10 @@ async function runRepairLanLogin(body: DeployBody, log: (m: string) => Promise<v
       throw new Error("ANON_KEY locale introuvable : impossible de réparer et vérifier le login LAN.");
     }
 
+    // Keep the local backend functions aligned with the repaired frontend and
+    // provision the passwordless localhost-only server diagnostics at once.
+    await syncLocalEdgeFunctions(conn, remoteDir, supaDir, log);
+
     // The previous implementation only rebuilt the frontend. That leaves an
     // old/missing same-origin Nginx proxy untouched, so the browser resolves
     // the correct LAN URL but Auth still cannot be reached. Repair the entire
@@ -3467,9 +3495,16 @@ async function runRepairLanLogin(body: DeployBody, log: (m: string) => Promise<v
       throw new Error(`Auth LAN reste inaccessible via le conteneur web (HTTP ${authSettingsCode || "000"})${detail.stdout ? ` : ${detail.stdout.trim()}` : ""}`);
     }
     await log(`✓ Test final Auth LAN réussi : ${proxyBase}/auth/v1/settings → HTTP ${authSettingsCode}`);
+    const authTokenProbe = await exec(conn, `curl -sS -m 10 -o /tmp/sf_auth_token_probe.json -w "%{http_code}" -X POST ${shQuote(`${proxyBase}/auth/v1/token?grant_type=password`)} -H ${shQuote(`apikey: ${anonKey}`)} -H ${shQuote(`Authorization: Bearer ${anonKey}`)} -H 'Content-Type: application/json' --data '{"email":"screenflow-probe-invalid@localhost","password":"invalid-probe-password"}' 2>/dev/null || true`);
+    const authTokenCode = (authTokenProbe.stdout || "").trim();
+    if (!/^(400|401|422)$/.test(authTokenCode)) {
+      const detail = await exec(conn, `tail -c 500 /tmp/sf_auth_token_probe.json 2>/dev/null || true`);
+      throw new Error(`Le endpoint de login LAN ne répond pas correctement (HTTP ${authTokenCode || "000"})${detail.stdout ? ` : ${detail.stdout.trim()}` : ""}`);
+    }
+    await log(`✓ Test réel du endpoint login LAN réussi : HTTP ${authTokenCode} (identifiants de test volontairement invalides)`);
     const publicBase = resolveBrowserAppBase(body, appPort);
     await log(`✓ Correctif définitif appliqué. Videz l'ancien cache du navigateur puis ouvrez ${publicBase}`);
-    return { action: "repair_lan_login", ok: true, url: publicBase, auth_http: authSettingsCode };
+    return { action: "repair_lan_login", ok: true, url: publicBase, auth_http: authSettingsCode, login_http: authTokenCode };
   } finally {
     try { conn.end(); } catch { /* ignore */ }
   }
@@ -3510,7 +3545,7 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
     build:
       context: .
       args:
-        VITE_SUPABASE_URL: ${quoteYaml(publicBase)}
+        VITE_SUPABASE_URL: '__SCREENFLOW_SAME_ORIGIN__'
         VITE_SUPABASE_PUBLISHABLE_KEY: ${quoteYaml(anonKey)}
         VITE_SUPABASE_PROJECT_ID: ${quoteYaml(projectId)}
         VITE_PUBLIC_APP_URL: ${quoteYaml(publicBase)}

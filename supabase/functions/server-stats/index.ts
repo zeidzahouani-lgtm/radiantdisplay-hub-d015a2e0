@@ -11,18 +11,19 @@ const corsHeaders = {
 };
 
 interface StatsBody {
-  host: string;
+  mode?: "local" | "ssh";
+  host?: string;
   port?: number;
-  username: string;
-  password: string;
+  username?: string;
+  password?: string;
 }
 
-function ssh(opts: { host: string; port: number; username: string; password: string }): Promise<Client> {
+function ssh(opts: { host: string; port: number; username: string; password?: string; privateKey?: string }): Promise<Client> {
   return new Promise((resolve, reject) => {
     const conn = new Client();
     conn
       .on("ready", () => resolve(conn))
-      .on("keyboard-interactive", (_n: any, _i: any, _l: any, prompts: any, finish: any) => finish(prompts.map(() => opts.password)))
+      .on("keyboard-interactive", (_n: any, _i: any, _l: any, prompts: any, finish: any) => finish(prompts.map(() => opts.password || "")))
       .on("error", reject)
       .connect({ ...opts, readyTimeout: 15000, tryKeyboard: true });
   });
@@ -59,18 +60,30 @@ Deno.serve(async (req) => {
       return new Response(JSON.stringify({ error: "Forbidden — admin only" }), { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
 
-    const body = (await req.json()) as StatsBody;
-    // Hôte: priorité au champ fourni par le client, sinon variable serveur SERVER_STATS_HOST.
-    const serverHost = (body.host && body.host.trim()) || Deno.env.get("SERVER_STATS_HOST") || "";
+    const body = (await req.json().catch(() => ({}))) as StatsBody;
+    const localMode = body.mode === "local";
+    let bundledLocalHost = "";
+    if (localMode) {
+      try { bundledLocalHost = (await Deno.readTextFile(new URL("./.local_host", import.meta.url))).trim(); } catch { /* optional */ }
+    }
+    const serverHost = (body.host && body.host.trim()) || Deno.env.get("SERVER_STATS_HOST") || bundledLocalHost || (localMode ? "host.docker.internal" : "");
+    const username = (body.username && body.username.trim()) || Deno.env.get("SERVER_STATS_USERNAME") || (localMode ? "root" : "");
+    const password = body.password || Deno.env.get("SERVER_STATS_PASSWORD") || "";
+    let privateKey = Deno.env.get("SERVER_STATS_PRIVATE_KEY") || "";
+    if (localMode && !privateKey) {
+      try {
+        privateKey = await Deno.readTextFile(new URL("./.local_id_ed25519", import.meta.url));
+      } catch { /* local key is provisioned by the deployment repair */ }
+    }
     if (!serverHost) {
       return new Response(JSON.stringify({ error: "Hôte serveur manquant (renseignez l'adresse de l'hôte)" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
-    if (!body.username || !body.password) {
-      return new Response(JSON.stringify({ error: "Identifiants SSH manquants" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    if (!username || (!password && !privateKey)) {
+      return new Response(JSON.stringify({ error: localMode ? "Diagnostic local non initialisé. Lancez une mise à jour rapide depuis Backup pour installer l'accès automatique." : "Identifiants SSH manquants" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
 
     // ===== Server stats via SSH =====
-    const conn = await ssh({ host: serverHost, port: body.port ?? 22, username: body.username, password: body.password });
+    const conn = await ssh({ host: serverHost, port: body.port ?? 22, username, password: password || undefined, privateKey: privateKey || undefined });
 
     const script = `
 echo "===HOSTNAME===" && hostname

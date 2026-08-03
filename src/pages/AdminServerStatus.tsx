@@ -1,8 +1,6 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
@@ -49,41 +47,33 @@ interface DbData {
 }
 
 export default function AdminServerStatus() {
-  const [host, setHost] = useState(() => localStorage.getItem("server_stats_host") || "");
-  const [port, setPort] = useState(() => localStorage.getItem("server_stats_port") || "22");
-  const [username, setUsername] = useState(() => localStorage.getItem("server_stats_user") || "root");
-  const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [server, setServer] = useState<ServerData | null>(null);
   const [database, setDatabase] = useState<DbData | null>(null);
   const [lastFetch, setLastFetch] = useState<string | null>(null);
 
-  const fetchStats = async () => {
-    if (!host || !username || !password) {
-      toast.error("Renseignez l'hôte, l'utilisateur et le mot de passe SSH");
-      return;
-    }
+  const fetchStats = useCallback(async (silent = false) => {
     setLoading(true);
     try {
-      localStorage.setItem("server_stats_host", host);
-      localStorage.setItem("server_stats_port", port);
-      localStorage.setItem("server_stats_user", username);
-
       const { data, error } = await supabase.functions.invoke("server-stats", {
-        body: { host: host.trim(), port: parseInt(port) || 22, username: username.trim(), password },
+        body: { mode: "local" },
       });
       if (error) throw error;
       if (!data?.success) throw new Error(data?.error || "Erreur inconnue");
       setServer(data.server);
       setDatabase(data.database);
       setLastFetch(new Date().toLocaleTimeString());
-      toast.success("Stats récupérées");
+      if (!silent) toast.success("État du serveur actualisé");
     } catch (e: any) {
       toast.error("Erreur: " + (e?.message || String(e)));
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    void fetchStats(true);
+  }, [fetchStats]);
 
   // Compute alerts from results
   const alerts: { level: "warning" | "critical"; title: string; message: string }[] = [];
@@ -133,33 +123,15 @@ export default function AdminServerStatus() {
         </p>
       </div>
 
-      {/* Connection card */}
+      {/* Automatic local monitoring */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-lg flex items-center gap-2"><Server className="h-5 w-5" />Connexion SSH</CardTitle>
-          <CardDescription>Renseignez l'adresse de l'hôte et vos identifiants SSH.</CardDescription>
+          <CardTitle className="text-lg flex items-center gap-2"><Server className="h-5 w-5" />Serveur local détecté</CardTitle>
+          <CardDescription>Le serveur où ScreenFlow est installé est contrôlé automatiquement via localhost.</CardDescription>
         </CardHeader>
         <CardContent>
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-3 items-end">
-            <div className="space-y-1.5 md:col-span-2">
-              <Label>Hôte</Label>
-              <Input value={host} onChange={e => setHost(e.target.value)} placeholder="ex: home-z.ddns.me ou 192.168.1.10" disabled={loading} />
-            </div>
-            <div className="space-y-1.5">
-              <Label>Port</Label>
-              <Input value={port} onChange={e => setPort(e.target.value)} placeholder="22" disabled={loading} />
-            </div>
-            <div className="space-y-1.5">
-              <Label>Utilisateur SSH</Label>
-              <Input value={username} onChange={e => setUsername(e.target.value)} placeholder="root" disabled={loading} />
-            </div>
-            <div className="space-y-1.5 md:col-span-4">
-              <Label>Mot de passe SSH</Label>
-              <Input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" disabled={loading} />
-            </div>
-          </div>
-          <div className="flex items-center gap-3 mt-4">
-            <Button onClick={fetchStats} disabled={loading} className="gap-2">
+          <div className="flex items-center gap-3">
+            <Button onClick={() => void fetchStats(false)} disabled={loading} className="gap-2">
               {loading ? <><Loader2 className="h-4 w-4 animate-spin" />Récupération…</> : <><RefreshCw className="h-4 w-4" />Actualiser</>}
             </Button>
             {lastFetch && <span className="text-xs text-muted-foreground">Dernière mise à jour: {lastFetch}</span>}

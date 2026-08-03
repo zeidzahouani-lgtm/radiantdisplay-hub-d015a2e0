@@ -3470,6 +3470,10 @@ async function runRepairLanLogin(body: DeployBody, log: (m: string) => Promise<v
       throw new Error("ANON_KEY locale introuvable : impossible de réparer et vérifier le login LAN.");
     }
 
+    // Keep the local backend functions aligned with the repaired frontend and
+    // provision the passwordless localhost-only server diagnostics at once.
+    await syncLocalEdgeFunctions(conn, remoteDir, supaDir, log);
+
     // The previous implementation only rebuilt the frontend. That leaves an
     // old/missing same-origin Nginx proxy untouched, so the browser resolves
     // the correct LAN URL but Auth still cannot be reached. Repair the entire
@@ -3484,9 +3488,16 @@ async function runRepairLanLogin(body: DeployBody, log: (m: string) => Promise<v
       throw new Error(`Auth LAN reste inaccessible via le conteneur web (HTTP ${authSettingsCode || "000"})${detail.stdout ? ` : ${detail.stdout.trim()}` : ""}`);
     }
     await log(`✓ Test final Auth LAN réussi : ${proxyBase}/auth/v1/settings → HTTP ${authSettingsCode}`);
+    const authTokenProbe = await exec(conn, `curl -sS -m 10 -o /tmp/sf_auth_token_probe.json -w "%{http_code}" -X POST ${shQuote(`${proxyBase}/auth/v1/token?grant_type=password`)} -H ${shQuote(`apikey: ${anonKey}`)} -H ${shQuote(`Authorization: Bearer ${anonKey}`)} -H 'Content-Type: application/json' --data '{"email":"screenflow-probe-invalid@localhost","password":"invalid-probe-password"}' 2>/dev/null || true`);
+    const authTokenCode = (authTokenProbe.stdout || "").trim();
+    if (!/^(400|401|422)$/.test(authTokenCode)) {
+      const detail = await exec(conn, `tail -c 500 /tmp/sf_auth_token_probe.json 2>/dev/null || true`);
+      throw new Error(`Le endpoint de login LAN ne répond pas correctement (HTTP ${authTokenCode || "000"})${detail.stdout ? ` : ${detail.stdout.trim()}` : ""}`);
+    }
+    await log(`✓ Test réel du endpoint login LAN réussi : HTTP ${authTokenCode} (identifiants de test volontairement invalides)`);
     const publicBase = resolveBrowserAppBase(body, appPort);
     await log(`✓ Correctif définitif appliqué. Videz l'ancien cache du navigateur puis ouvrez ${publicBase}`);
-    return { action: "repair_lan_login", ok: true, url: publicBase, auth_http: authSettingsCode };
+    return { action: "repair_lan_login", ok: true, url: publicBase, auth_http: authSettingsCode, login_http: authTokenCode };
   } finally {
     try { conn.end(); } catch { /* ignore */ }
   }

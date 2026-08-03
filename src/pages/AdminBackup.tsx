@@ -1200,6 +1200,12 @@ To rebuild manually: docker compose up -d --build
       successMessage: "Realtime réparé ✓",
     });
 
+  const handleRepairLanLogin = () =>
+    runSshAction("repair_lan_login", {}, {
+      initialLog: "🌐 Correctif login LAN : bascule des appels API sur l'origine du navigateur…",
+      successMessage: "Correctif login LAN appliqué ✓",
+    });
+
   const handleRepairApiUrl = () =>
     runSshAction("repair_local_api_url", {}, {
       initialLog: "🌐 Correction de l'URL API locale…",
@@ -1389,6 +1395,7 @@ To rebuild manually: docker compose up -d --build
     repair_uploads_now: { label: "Corriger uploads sans redéploiement", run: handleRepairUploadsNow },
     repair_local_writes: { label: "Réparer upload/écrans", run: handleRepairLocalWrites },
     repair_local_api_url: { label: "Corriger l'URL API", run: handleRepairApiUrl },
+    repair_lan_login: { label: "Corriger le login en LAN", run: handleRepairLanLogin },
     repair_storage_buckets: { label: "Réparer buckets Storage", run: handleRepairBuckets },
     repair_realtime: { label: "Réparer Realtime", run: handleRepairRealtime },
     reset_admin_password: { label: "Créer/réparer admin", run: handleResetAdminPassword },
@@ -2167,6 +2174,16 @@ To rebuild manually: docker compose up -d --build
                   title="Répare les uploads bibliothèque et QR sans refaire un déploiement complet : buckets, permissions, restrictions MIME, Storage/Kong et proxy /storage/v1."
                 >
                   <Upload className="h-4 w-4" />Corriger uploads sans redéploiement
+                </Button>
+                <Button
+                  type="button"
+                  variant="default"
+                  className="gap-2"
+                  onClick={handleRepairLanLogin}
+                  disabled={sshDeploying || !sshHost || !sshUser || !sshPassword}
+                  title="Corrige le login impossible depuis l'IP LAN : les appels Auth/REST/Storage/Realtime restent sur l'origine du navigateur (proxy Nginx) au lieu de l'URL publique WAN, puis reconstruit le conteneur web."
+                >
+                  <Wifi className="h-4 w-4" />Corriger le login en LAN
                 </Button>
                 <Button
                   type="button"

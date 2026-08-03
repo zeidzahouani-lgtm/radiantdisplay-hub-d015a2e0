@@ -23,7 +23,7 @@ const corsHeaders = {
 
 interface DeployBody {
   // Action: "deploy" (default), "reset_admin_password", or "check_admin_status" (read-only diagnostic)
-  action?: "deploy" | "reset_admin_password" | "check_admin_status" | "repair_local_writes" | "repair_local_api_url" | "repair_uploads_now" | "diagnose_server" | "restart_stack" | "repair_web_container" | "repair_storage_buckets" | "repair_realtime" | "apply_local_migrations" | "quick_update" | "build_status" | "network_inspect" | "network_recreate" | "network_set_subnet" | "network_set_hostname" | "network_get_config" | "network_set_container_ip";
+  action?: "deploy" | "reset_admin_password" | "check_admin_status" | "repair_local_writes" | "repair_local_api_url" | "repair_lan_login" | "repair_uploads_now" | "diagnose_server" | "restart_stack" | "repair_web_container" | "repair_storage_buckets" | "repair_realtime" | "apply_local_migrations" | "quick_update" | "build_status" | "network_inspect" | "network_recreate" | "network_set_subnet" | "network_set_hostname" | "network_get_config" | "network_set_container_ip";
   // Custom Docker network subnet (CIDR), e.g. 172.28.0.0/16
   network_subnet?: string;
   network_gateway?: string;
@@ -1702,6 +1702,8 @@ async function runDeploymentJob(
       await runResetAdminPassword(body, log);
     } else if (body.action === "check_admin_status") {
       await runCheckAdminStatus(body, log, persist);
+    } else if (body.action === "repair_lan_login") {
+      directResult = await runRepairLanLogin(body, log);
     } else if (body.action === "repair_uploads_now") {
       directResult = await runRepairUploadsNow(body, log);
     } else if (body.action === "repair_local_writes") {
@@ -3398,6 +3400,59 @@ async function runRestartStack(body: DeployBody, log: (m: string) => Promise<voi
 }
 
 // ===== Repair the web (frontend) container: diagnose why it is down, rebuild and verify uploads proxy =====
+async function patchRemoteLanOriginFallback(conn: Client, repoDir: string, log: (m: string) => Promise<void> | void) {
+  const script = `python3 - <<'PY'
+from pathlib import Path
+p = Path(${JSON.stringify(`${repoDir}/src/lib/env.ts`)})
+if p.exists():
+    s = p.read_text()
+    before = s
+    s = s.replace('if (!runtimeOrigin || appEnv.supabaseProjectId !== "local") return false;', 'if (!runtimeOrigin) return false;')
+    s = s.replace('if (appEnv.supabaseProjectId === "local" && isLocalNetworkHostname(runtimeHost) && runtimeOrigin && runtimeHost !== configuredHost) {', 'if (isLocalNetworkHostname(runtimeHost) && runtimeOrigin && runtimeHost !== configuredHost) {')
+    if s != before:
+        p.write_text(s)
+        print('PATCHED')
+    else:
+        print('ALREADY_OK')
+else:
+    print('MISSING')
+PY`;
+  const out = await exec(conn, script);
+  const state = `${out.stdout || ""}`.trim();
+  if (state.includes("PATCHED")) {
+    await log("✓ src/lib/env.ts corrigé : API sur l'origine courante dès qu'on est servi depuis le LAN");
+  } else if (state.includes("ALREADY_OK")) {
+    await log("✓ src/lib/env.ts déjà à jour (fallback origine LAN présent)");
+  } else {
+    await log("⚠ src/lib/env.ts introuvable sur le dépôt distant — le client runtime prend le relais");
+  }
+}
+
+async function runRepairLanLogin(body: DeployBody, log: (m: string) => Promise<void> | void) {
+  const port = body.port ?? 22;
+  const remoteDir = body.remote_dir || "/opt/screenflow";
+  const repoDir = `${remoteDir}/repo`;
+  await log("→ Correctif login LAN : les appels Auth/REST/Storage doivent rester sur l'origine du navigateur");
+  await log(`→ Connexion SSH ${body.username}@${body.host}:${port}…`);
+  const conn = await ssh({ host: body.host, port, username: body.username, password: body.password });
+  try {
+    await log("✓ SSH connecté");
+    const pull = await exec(conn, `cd ${repoDir} && (git fetch --all --prune && git reset --hard @{u}) 2>&1 | tail -n 5`);
+    await log(`→ Dépôt distant synchronisé${pull.code === 0 ? "" : " (git indisponible, patch local appliqué)"}`);
+    await patchRemoteLanOriginFallback(conn, repoDir, log);
+    await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
+  } finally {
+    try { conn.end(); } catch { /* ignore */ }
+  }
+  await log("→ Reconstruction du conteneur web pour appliquer le correctif…");
+  const rebuilt = await runRepairWebContainer(body, log);
+  const ok = !rebuilt || rebuilt.ok !== false;
+  if (ok) {
+    await log("✓ Correctif appliqué : reconnectez-vous via l'IP LAN du serveur");
+  }
+  return { ...(rebuilt || {}), action: "repair_lan_login", ok, web_rebuild: rebuilt };
+}
+
 async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promise<void> | void) {
   const port = body.port ?? 22;
   const remoteDir = body.remote_dir || "/opt/screenflow";

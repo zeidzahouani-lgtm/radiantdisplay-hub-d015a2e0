@@ -1362,6 +1362,23 @@ async function syncLocalEdgeFunctions(conn: Client, remoteDir: string, supaDir: 
     `(docker compose restart functions 2>&1 || docker compose restart edge-runtime 2>&1 || true)`;
   const result = await exec(conn, cmd);
   await log((`${result.stdout}${result.stderr}`).slice(-1200));
+  const autoStats = await exec(conn, `set -e
+KEY_DIR=${shQuote(`${supaDir}/volumes/functions/server-stats`)}
+mkdir -p "$KEY_DIR" /root/.ssh
+if [ ! -s "$KEY_DIR/.local_id_ed25519" ]; then ssh-keygen -q -t ed25519 -N '' -C screenflow-local-stats -f "$KEY_DIR/.local_id_ed25519"; fi
+touch /root/.ssh/authorized_keys
+PUB=$(cat "$KEY_DIR/.local_id_ed25519.pub")
+grep -qxF "$PUB" /root/.ssh/authorized_keys || printf '%s\n' "$PUB" >> /root/.ssh/authorized_keys
+chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys "$KEY_DIR/.local_id_ed25519"
+cd ${supaDir}
+CID=$(docker compose ps -q functions 2>/dev/null || docker compose ps -q edge-runtime 2>/dev/null || true)
+GW=$(docker inspect "$CID" --format '{{range .NetworkSettings.Networks}}{{println .Gateway}}{{end}}' 2>/dev/null | awk 'NF{print; exit}')
+[ -n "$GW" ] || GW=host.docker.internal
+for k in SERVER_STATS_HOST SERVER_STATS_USERNAME; do sed -i "/^$k=/d" .env; done
+printf 'SERVER_STATS_HOST=%s\nSERVER_STATS_USERNAME=root\n' "$GW" >> .env
+(docker compose up -d --force-recreate functions 2>&1 || docker compose up -d --force-recreate edge-runtime 2>&1 || true)`);
+  if (autoStats.code === 0) await log("✓ Diagnostic serveur automatique localhost configuré (clé SSH locale dédiée)");
+  else await log(`⚠ Configuration du diagnostic automatique incomplète : ${(`${autoStats.stdout}${autoStats.stderr}`).slice(-500)}`);
   await log("✓ Fonctions backend locales synchronisées");
 }
 

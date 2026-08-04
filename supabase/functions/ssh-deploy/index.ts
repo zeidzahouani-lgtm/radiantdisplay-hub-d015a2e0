@@ -2058,7 +2058,21 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
       await exec(conn, `${sudoPrefix}mkdir -p ${remoteDir} && ${sudoPrefix}chown ${body.username}:${body.username} ${remoteDir} && if [ -d ${remoteDir}/repo ]; then ${sudoPrefix}chown -R ${body.username}:${body.username} ${remoteDir}/repo; fi`);
       log("✓ Remote directory ready");
 
+      // Un dépôt existant peut pointer vers une ANCIENNE URL : on compare le remote
+      // réel (sans identifiants) et on re-clone si le dépôt n'est pas le bon.
+      let reuseExistingRepo = isExistingInstall;
       if (isExistingInstall) {
+        const currentRemote = normalizeGitUrl(
+          (await exec(conn, `cd ${remoteDir}/repo && git remote get-url origin 2>/dev/null || echo ""`)).stdout.trim(),
+        );
+        if (currentRemote && currentRemote !== cleanGitUrl) {
+          await log(`⚠ Dépôt distant différent détecté (${maskGitUrl(currentRemote)}) → re-clone depuis ${cleanGitUrl}`);
+          await exec(conn, `rm -rf ${remoteDir}/repo`);
+          reuseExistingRepo = false;
+        }
+      }
+
+      if (reuseExistingRepo) {
         await log(`→ Mise à jour du repo existant (git fetch + reset --hard origin/${branch})…`);
         const pull = await exec(
           conn,
@@ -2075,20 +2089,30 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
           const clone = await exec(conn, `git clone --depth 1 --branch ${branch} '${gitUrl}' ${remoteDir}/repo 2>&1`);
           log(clone.stdout.slice(-1500));
           if (clone.code !== 0) {
-            throw new Error(`Échec du clone Git de secours. ${clone.stderr.slice(-300)}`);
+            throw new Error(`Échec du clone Git de secours (${cleanGitUrl}). ${clone.stderr.slice(-300)}`);
           }
         }
         await log("✓ Repo mis à jour vers la dernière version");
       } else {
-        log(`→ Cloning ${body.git_url} (branch: ${branch})…`);
+        log(`→ Cloning ${cleanGitUrl} (branch: ${branch})…`);
         await exec(conn, `rm -rf ${remoteDir}/repo`);
         const clone = await exec(conn, `git clone --depth 1 --branch ${branch} '${gitUrl}' ${remoteDir}/repo 2>&1`);
         log(clone.stdout.slice(-1500));
         if (clone.code !== 0) {
-          throw new Error(`Échec du clone Git. Vérifiez l'URL/branche/token. ${clone.stderr.slice(-300)}`);
+          throw new Error(`Échec du clone Git (${cleanGitUrl}, branche ${branch}). Vérifiez l'URL/branche/token. ${clone.stderr.slice(-300)}`);
         }
         log("✓ Repo cloned");
       }
+
+      // Contrôle explicite : le dépôt réellement présent doit correspondre à l'URL demandée.
+      const finalRemote = normalizeGitUrl(
+        (await exec(conn, `cd ${remoteDir}/repo && git remote get-url origin 2>/dev/null || echo ""`)).stdout.trim(),
+      );
+      if (finalRemote !== cleanGitUrl) {
+        throw new Error(`Le dépôt copié sur le serveur (${maskGitUrl(finalRemote) || "inconnu"}) ne correspond pas à l'URL demandée (${cleanGitUrl}).`);
+      }
+      await log(`✓ Dépôt vérifié sur le serveur : ${cleanGitUrl}`);
+
 
       // For an external/shared backend all build credentials are already known,
       // so start the web build before any optional local infrastructure work.

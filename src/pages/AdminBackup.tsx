@@ -1247,7 +1247,12 @@ To rebuild manually: docker compose up -d --build
   const handleQuickUpdate = () => {
     setQuickUpdateResult(null);
     setMigrationResult(null);
-    runSshAction("quick_update", { git_branch: sshGitBranch.trim() || "main" }, {
+    runSshAction("quick_update", {
+      git_url: sshGitUrl.trim() || undefined,
+      git_branch: sshGitBranch.trim() || "main",
+      git_token: sshGitToken.trim() || undefined,
+    }, {
+
       initialLog: "⚡ Mise à jour rapide (git pull + migrations + rebuild web)…",
       successMessage: "Mise à jour appliquée ✓",
       onResult: (r) => {

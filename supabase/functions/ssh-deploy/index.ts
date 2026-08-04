@@ -1878,7 +1878,34 @@ Deno.serve(async (req) => {
   }
 });
 
+// ===== Git URL helpers =====
+// L'URL collée depuis l'interface GitHub/GitLab contient souvent une page web
+// (/tree/main, /blob/..., ?tab=readme) ou des identifiants déjà intégrés.
+// Sans normalisation, le serveur clone une URL invalide ou l'ancien dépôt.
+function normalizeGitUrl(raw: string): string {
+  let url = (raw || "").trim().replace(/^["']|["']$/g, "");
+  if (!url) return "";
+  if (/^git@/.test(url)) return url.replace(/\/+$/, "");
+  url = url.split("#")[0].split("?")[0];
+  // Retire d'éventuels identifiants déjà présents (ils sont réinjectés depuis le token).
+  url = url.replace(/^(https?:\/\/)[^/@]+@/, "$1");
+  url = url.replace(/\/(tree|blob|commits?|releases|pulls?|issues)\/.*$/i, "");
+  url = url.replace(/\/+$/, "");
+  if (/^https?:\/\/[^/]+\/[^/]+\/[^/]+$/.test(url) && !/\.git$/.test(url)) url += ".git";
+  return url;
+}
+
+function maskGitUrl(url: string): string {
+  return url.replace(/^(https?:\/\/)[^/@]+@/, "$1***@");
+}
+
+function withGitToken(url: string, token?: string): string {
+  if (!token || !/^https?:\/\//.test(url)) return url;
+  return url.replace(/^(https?:\/\/)/, `$1${encodeURIComponent(token)}@`);
+}
+
 // ===== The actual deployment logic, now wrapped =====
+
 async function runDeployment(body: DeployBody, log: (m: string) => Promise<void> | void) {
   const port = body.port ?? 22;
   const remoteDir = body.remote_dir || "/opt/screenflow";
@@ -1926,10 +1953,13 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
     throw new Error(`Déploiement interrompu proprement avant timeout. Dernière étape: ${nextStep}. Relancez le déploiement; les conteneurs déjà téléchargés seront réutilisés.`);
   };
 
-  let gitUrl = body.git_url.trim();
-  if (body.git_token && /^https?:\/\//.test(gitUrl)) {
-    gitUrl = gitUrl.replace(/^(https?:\/\/)/, `$1${encodeURIComponent(body.git_token)}@`);
+  const cleanGitUrl = normalizeGitUrl(body.git_url);
+  if (!cleanGitUrl) {
+    throw new Error("URL du dépôt Git manquante ou invalide. Exemple attendu : https://github.com/utilisateur/depot.git");
   }
+  const gitUrl = withGitToken(cleanGitUrl, body.git_token?.trim());
+  await log(`→ Dépôt Git utilisé : ${cleanGitUrl} (branche ${branch})`);
+
 
   await log(`→ Connecting to ${body.username}@${body.host}:${port}…`);
   const conn = await ssh({ host: body.host, port, username: body.username, password: body.password });
@@ -2028,7 +2058,21 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
       await exec(conn, `${sudoPrefix}mkdir -p ${remoteDir} && ${sudoPrefix}chown ${body.username}:${body.username} ${remoteDir} && if [ -d ${remoteDir}/repo ]; then ${sudoPrefix}chown -R ${body.username}:${body.username} ${remoteDir}/repo; fi`);
       log("✓ Remote directory ready");
 
+      // Un dépôt existant peut pointer vers une ANCIENNE URL : on compare le remote
+      // réel (sans identifiants) et on re-clone si le dépôt n'est pas le bon.
+      let reuseExistingRepo = isExistingInstall;
       if (isExistingInstall) {
+        const currentRemote = normalizeGitUrl(
+          (await exec(conn, `cd ${remoteDir}/repo && git remote get-url origin 2>/dev/null || echo ""`)).stdout.trim(),
+        );
+        if (currentRemote && currentRemote !== cleanGitUrl) {
+          await log(`⚠ Dépôt distant différent détecté (${maskGitUrl(currentRemote)}) → re-clone depuis ${cleanGitUrl}`);
+          await exec(conn, `rm -rf ${remoteDir}/repo`);
+          reuseExistingRepo = false;
+        }
+      }
+
+      if (reuseExistingRepo) {
         await log(`→ Mise à jour du repo existant (git fetch + reset --hard origin/${branch})…`);
         const pull = await exec(
           conn,
@@ -2045,20 +2089,30 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
           const clone = await exec(conn, `git clone --depth 1 --branch ${branch} '${gitUrl}' ${remoteDir}/repo 2>&1`);
           log(clone.stdout.slice(-1500));
           if (clone.code !== 0) {
-            throw new Error(`Échec du clone Git de secours. ${clone.stderr.slice(-300)}`);
+            throw new Error(`Échec du clone Git de secours (${cleanGitUrl}). ${clone.stderr.slice(-300)}`);
           }
         }
         await log("✓ Repo mis à jour vers la dernière version");
       } else {
-        log(`→ Cloning ${body.git_url} (branch: ${branch})…`);
+        log(`→ Cloning ${cleanGitUrl} (branch: ${branch})…`);
         await exec(conn, `rm -rf ${remoteDir}/repo`);
         const clone = await exec(conn, `git clone --depth 1 --branch ${branch} '${gitUrl}' ${remoteDir}/repo 2>&1`);
         log(clone.stdout.slice(-1500));
         if (clone.code !== 0) {
-          throw new Error(`Échec du clone Git. Vérifiez l'URL/branche/token. ${clone.stderr.slice(-300)}`);
+          throw new Error(`Échec du clone Git (${cleanGitUrl}, branche ${branch}). Vérifiez l'URL/branche/token. ${clone.stderr.slice(-300)}`);
         }
         log("✓ Repo cloned");
       }
+
+      // Contrôle explicite : le dépôt réellement présent doit correspondre à l'URL demandée.
+      const finalRemote = normalizeGitUrl(
+        (await exec(conn, `cd ${remoteDir}/repo && git remote get-url origin 2>/dev/null || echo ""`)).stdout.trim(),
+      );
+      if (finalRemote !== cleanGitUrl) {
+        throw new Error(`Le dépôt copié sur le serveur (${maskGitUrl(finalRemote) || "inconnu"}) ne correspond pas à l'URL demandée (${cleanGitUrl}).`);
+      }
+      await log(`✓ Dépôt vérifié sur le serveur : ${cleanGitUrl}`);
+
 
       // For an external/shared backend all build credentials are already known,
       // so start the web build before any optional local infrastructure work.
@@ -3945,12 +3999,21 @@ async function runQuickUpdate(body: DeployBody, log: (m: string) => Promise<void
     const supaPresent = (await exec(conn, `[ -f ${supaDir}/docker-compose.yml ] && echo OK || echo NO`)).stdout.includes("OK");
 
     // ===== 1. Git pull =====
+    // La mise à jour rapide doit utiliser l'URL de dépôt saisie dans l'interface,
+    // sinon elle continue de tirer l'ancien dépôt enregistré sur le serveur.
+    const quickCleanUrl = normalizeGitUrl(body.git_url || "");
+    if (quickCleanUrl) {
+      const quickAuthUrl = withGitToken(quickCleanUrl, body.git_token?.trim());
+      await exec(conn, `cd ${repoDir} && git remote set-url origin '${quickAuthUrl}' 2>&1`);
+      await log(`→ Dépôt Git utilisé : ${quickCleanUrl} (branche ${branch})`);
+    }
     await log(`→ git fetch + reset --hard origin/${branch}…`);
     const beforeSha = (await exec(conn, `cd ${repoDir} && git rev-parse HEAD 2>/dev/null || echo none`)).stdout.trim();
     const pull = await exec(
       conn,
       `cd ${repoDir} && git fetch --depth 1 origin ${branch} 2>&1 && git reset --hard origin/${branch} 2>&1 && git clean -fd -e docker-compose.yml -e ssl 2>&1`,
     );
+
     if (pull.code !== 0) {
       throw new Error(`git pull a échoué : ${pull.stdout.slice(-400)}`);
     }

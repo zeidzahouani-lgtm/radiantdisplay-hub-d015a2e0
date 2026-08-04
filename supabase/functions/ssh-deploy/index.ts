@@ -1953,10 +1953,13 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
     throw new Error(`Déploiement interrompu proprement avant timeout. Dernière étape: ${nextStep}. Relancez le déploiement; les conteneurs déjà téléchargés seront réutilisés.`);
   };
 
-  let gitUrl = body.git_url.trim();
-  if (body.git_token && /^https?:\/\//.test(gitUrl)) {
-    gitUrl = gitUrl.replace(/^(https?:\/\/)/, `$1${encodeURIComponent(body.git_token)}@`);
+  const cleanGitUrl = normalizeGitUrl(body.git_url);
+  if (!cleanGitUrl) {
+    throw new Error("URL du dépôt Git manquante ou invalide. Exemple attendu : https://github.com/utilisateur/depot.git");
   }
+  const gitUrl = withGitToken(cleanGitUrl, body.git_token?.trim());
+  await log(`→ Dépôt Git utilisé : ${cleanGitUrl} (branche ${branch})`);
+
 
   await log(`→ Connecting to ${body.username}@${body.host}:${port}…`);
   const conn = await ssh({ host: body.host, port, username: body.username, password: body.password });

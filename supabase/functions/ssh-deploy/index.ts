@@ -1878,7 +1878,34 @@ Deno.serve(async (req) => {
   }
 });
 
+// ===== Git URL helpers =====
+// L'URL collée depuis l'interface GitHub/GitLab contient souvent une page web
+// (/tree/main, /blob/..., ?tab=readme) ou des identifiants déjà intégrés.
+// Sans normalisation, le serveur clone une URL invalide ou l'ancien dépôt.
+function normalizeGitUrl(raw: string): string {
+  let url = (raw || "").trim().replace(/^["']|["']$/g, "");
+  if (!url) return "";
+  if (/^git@/.test(url)) return url.replace(/\/+$/, "");
+  url = url.split("#")[0].split("?")[0];
+  // Retire d'éventuels identifiants déjà présents (ils sont réinjectés depuis le token).
+  url = url.replace(/^(https?:\/\/)[^/@]+@/, "$1");
+  url = url.replace(/\/(tree|blob|commits?|releases|pulls?|issues)\/.*$/i, "");
+  url = url.replace(/\/+$/, "");
+  if (/^https?:\/\/[^/]+\/[^/]+\/[^/]+$/.test(url) && !/\.git$/.test(url)) url += ".git";
+  return url;
+}
+
+function maskGitUrl(url: string): string {
+  return url.replace(/^(https?:\/\/)[^/@]+@/, "$1***@");
+}
+
+function withGitToken(url: string, token?: string): string {
+  if (!token || !/^https?:\/\//.test(url)) return url;
+  return url.replace(/^(https?:\/\/)/, `$1${encodeURIComponent(token)}@`);
+}
+
 // ===== The actual deployment logic, now wrapped =====
+
 async function runDeployment(body: DeployBody, log: (m: string) => Promise<void> | void) {
   const port = body.port ?? 22;
   const remoteDir = body.remote_dir || "/opt/screenflow";

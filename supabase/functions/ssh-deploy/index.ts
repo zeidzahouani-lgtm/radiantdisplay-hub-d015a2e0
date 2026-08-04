@@ -3999,12 +3999,21 @@ async function runQuickUpdate(body: DeployBody, log: (m: string) => Promise<void
     const supaPresent = (await exec(conn, `[ -f ${supaDir}/docker-compose.yml ] && echo OK || echo NO`)).stdout.includes("OK");
 
     // ===== 1. Git pull =====
+    // La mise à jour rapide doit utiliser l'URL de dépôt saisie dans l'interface,
+    // sinon elle continue de tirer l'ancien dépôt enregistré sur le serveur.
+    const quickCleanUrl = normalizeGitUrl(body.git_url || "");
+    if (quickCleanUrl) {
+      const quickAuthUrl = withGitToken(quickCleanUrl, body.git_token?.trim());
+      await exec(conn, `cd ${repoDir} && git remote set-url origin '${quickAuthUrl}' 2>&1`);
+      await log(`→ Dépôt Git utilisé : ${quickCleanUrl} (branche ${branch})`);
+    }
     await log(`→ git fetch + reset --hard origin/${branch}…`);
     const beforeSha = (await exec(conn, `cd ${repoDir} && git rev-parse HEAD 2>/dev/null || echo none`)).stdout.trim();
     const pull = await exec(
       conn,
       `cd ${repoDir} && git fetch --depth 1 origin ${branch} 2>&1 && git reset --hard origin/${branch} 2>&1 && git clean -fd -e docker-compose.yml -e ssl 2>&1`,
     );
+
     if (pull.code !== 0) {
       throw new Error(`git pull a échoué : ${pull.stdout.slice(-400)}`);
     }

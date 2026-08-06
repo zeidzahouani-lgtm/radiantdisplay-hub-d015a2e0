@@ -221,6 +221,12 @@ async function prepareEarlyWebDeployment(
 ${composeServiceNetworks(earlyKongUpstream)}    ports:
       - "${appPort}:80"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
 ${composeTopLevelNetworks(earlyKongUpstream)}`;
   await uploadFile(conn, `${repoDir}/docker-compose.yml`, Buffer.from(compose));
   await patchRemoteBuildEntrypoint(conn, repoDir, log);
@@ -2511,6 +2517,12 @@ ${localFunctionLocations}
       - "host.docker.internal:host-gateway"
 ${composeServiceNetworks(kongUpstream)}${portsBlock}
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
 ${composeTopLevelNetworks(kongUpstream)}`;
 
       await uploadFile(conn, `${remoteDir}/repo/Dockerfile`, Buffer.from(dockerfile));
@@ -2635,6 +2647,18 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
       );
     }
 
+    const freshWebCid = (await exec(conn, `cd ${remoteDir}/repo && (docker compose ps -q web || docker-compose ps -q web) 2>/dev/null | head -1`)).stdout.trim();
+    if (!freshWebCid) throw new Error("Le conteneur web est introuvable après le premier build.");
+    const freshBundleCheck = await exec(conn, `docker exec ${freshWebCid} sh -c 'if grep -R -q "const [A-Za-z0-9_$]*=\"__SCREENFLOW_SAME_ORIGIN__\".*createClient\|YTe(\"__SCREENFLOW_SAME_ORIGIN__\"" /usr/share/nginx/html/assets 2>/dev/null; then echo INVALID_MARKER; else echo OK; fi'`);
+    connectivity.browser_bundle = {
+      ok: (freshBundleCheck.stdout || "").includes("OK"),
+      detail: (freshBundleCheck.stdout || freshBundleCheck.stderr || "contrôle impossible").trim(),
+    };
+    await log(`  • Bundle client : ${connectivity.browser_bundle.ok ? "✓" : "✗"} ${connectivity.browser_bundle.detail}`);
+    if (!connectivity.browser_bundle.ok) {
+      throw new Error("Le bundle du premier déploiement contient une URL backend invalide et produirait une page blanche.");
+    }
+
     // A loopback success does not prove that the host firewall/provider allows
     // remote traffic. Probe the exact browser URL from outside the SSH server.
     try {
@@ -2672,6 +2696,19 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
       await log(`  • Supabase Auth    : ${connectivity.auth.ok ? "✓" : "✗"} ${connectivity.auth.detail}`);
       await log(`  • Supabase Storage : ${connectivity.storage.ok ? "✓" : "✗"} ${connectivity.storage.detail}`);
       await log(`  • Postgres         : ${connectivity.postgres.ok ? "✓" : "✗"} ${connectivity.postgres.detail}`);
+
+      const initialUploadTests = [
+        await verifyStorageUploadAtBase(conn, `${remoteDir}/supabase`, `http://127.0.0.1:${supaKongPort}`, supabaseAnonOverride, "uploads", "initial_deploy"),
+        await verifyStorageUploadAtBase(conn, `${remoteDir}/supabase`, `http://127.0.0.1:${supaKongPort}`, supabaseAnonOverride, "media", "initial_deploy"),
+      ];
+      connectivity.storage_writes = {
+        ok: initialUploadTests.every((test) => test.ok),
+        detail: initialUploadTests.map((test) => `${test.bucket}=HTTP ${test.status}${test.detail ? ` (${test.detail})` : ""}`).join(", "),
+      };
+      await log(`  • Écriture médias  : ${connectivity.storage_writes.ok ? "✓" : "✗"} ${connectivity.storage_writes.detail}`);
+      if (!connectivity.storage_writes.ok) {
+        throw new Error(`Le backend répond mais l'écriture réelle dans les buckets média échoue (${connectivity.storage_writes.detail}).`);
+      }
 
       // A healthy Kong is not enough: browsers only use the web container's
       // same-origin proxy. Validate that exact route before declaring success.

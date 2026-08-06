@@ -2512,7 +2512,7 @@ ${portsBlock}
       await patchRemoteLanOriginFallback(conn, `${remoteDir}/repo`, log);
       await patchRemoteRuntimeSupabaseClient(conn, `${remoteDir}/repo`, log);
       if (installSupabase) {
-        const buildInputCheck = await exec(conn, `set -e; grep -Fq "projectId === 'local'" ${remoteDir}/repo/src/integrations/supabase/runtime-client.ts; grep -Fq 'src/integrations/supabase/runtime-client.ts' ${remoteDir}/repo/vite.config.ts; grep -Eq "VITE_SUPABASE_URL: '[[:space:]]*https?://" ${remoteDir}/repo/docker-compose.yml; grep -Fq "VITE_SUPABASE_PROJECT_ID: 'local'" ${remoteDir}/repo/docker-compose.yml`);
+        const buildInputCheck = await exec(conn, `set -e; grep -Fq "projectId === 'local'" ${remoteDir}/repo/src/integrations/supabase/runtime-client.ts; grep -Fq 'src/integrations/supabase/runtime-client.ts' ${remoteDir}/repo/vite.config.ts; grep -Fq "VITE_SUPABASE_URL: '__SCREENFLOW_SAME_ORIGIN__'" ${remoteDir}/repo/docker-compose.yml; grep -Fq "VITE_SUPABASE_PROJECT_ID: 'local'" ${remoteDir}/repo/docker-compose.yml`);
         if (buildInputCheck.code !== 0) {
           throw new Error("Les invariants du client LAN sont absents des fichiers de build du premier déploiement.");
         }
@@ -3819,6 +3819,28 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
       const failureLogs = await exec(conn, `cd ${repoDir} && (docker compose logs --tail=120 web || docker-compose logs --tail=120 web) 2>&1 || true`);
       result.cause = `Le conteneur web ne sert pas l'application (Docker ${result.container_state || "absent"}, HTTP ${result.app_http}). ${(failureLogs.stdout || failureLogs.stderr || "").slice(-2500)}`;
       throw new Error(result.cause);
+    }
+
+    // Validate that index.html references a real production entry module and
+    // that Nginx serves it as JavaScript. A plain 200 on index.html can hide a
+    // broken/missing asset and still produce a completely blank browser page.
+    const assetProbe = await exec(conn, `set -e; BASE=http://127.0.0.1:${appPort}; HTML=$(curl -fsS "$BASE/"); ASSET=$(printf '%s' "$HTML" | grep -oE '<script[^>]+src="[^"]+"' | head -1 | sed -E 's/.*src="([^"]+)"/\\1/'); [ -n "$ASSET" ]; case "$ASSET" in http://*|https://*) URL="$ASSET" ;; *) URL="$BASE${'$'}{ASSET#/}"; URL="$BASE/${'$'}{ASSET#/}" ;; esac; CODE=$(curl -sS -m 10 -o /tmp/sf_entry.js -w '%{http_code}' "$URL"); [ "$CODE" = 200 ]; [ -s /tmp/sf_entry.js ]; printf 'OK|%s|%s' "$ASSET" "$(wc -c </tmp/sf_entry.js)"`);
+    result.entry_asset = (assetProbe.stdout || "").trim();
+    if (assetProbe.code !== 0 || !result.entry_asset.startsWith("OK|")) {
+      result.cause = `La page HTML répond, mais son module JavaScript principal est absent ou vide. ${assetProbe.stderr || assetProbe.stdout}`.trim();
+      throw new Error(result.cause);
+    }
+    await log(`✓ Module JavaScript principal réellement servi (${result.entry_asset.split("|")[2] || "taille inconnue"} octets)`);
+
+    if (localBackendPresent && anonKey) {
+      const authProbe = await exec(conn, `curl -sS -m 10 -o /tmp/sf_auth_settings.json -w '%{http_code}' http://127.0.0.1:${appPort}/auth/v1/settings -H ${shQuote(`apikey: ${anonKey}`)} 2>/dev/null || true`);
+      result.auth_http = (authProbe.stdout || "").trim();
+      if (!/^2\d\d$/.test(result.auth_http)) {
+        const detail = await exec(conn, `tail -c 500 /tmp/sf_auth_settings.json 2>/dev/null || true`);
+        result.cause = `L'application web fonctionne, mais son proxy Auth local échoue (HTTP ${result.auth_http || "000"}). ${(detail.stdout || "").trim()}`.trim();
+        throw new Error(result.cause);
+      }
+      await log(`✓ Proxy Auth same-origin validé via le conteneur web (HTTP ${result.auth_http})`);
     }
 
     // HTTP 200 only proves that Nginx returned index.html. Also inspect the

@@ -2997,7 +2997,18 @@ async function patchRunningWebProxyForUploads(conn: Client, body: DeployBody, ko
     return result;
   }
 
+  // Un proxy vers `kong:8000` n'est résoluble que si le conteneur web est
+  // attaché au réseau Docker de la stack Supabase : on l'attache à chaud.
+  if (kongUpstream.network) {
+    const attach = await exec(conn, `docker network connect ${kongUpstream.network} ${cid} 2>&1 || true`);
+    const attachOut = `${attach.stdout}${attach.stderr}`;
+    await log(/already exists/i.test(attachOut)
+      ? `✓ Conteneur web déjà attaché au réseau ${kongUpstream.network}`
+      : `✓ Conteneur web attaché au réseau ${kongUpstream.network}`);
+  }
+
   await log("→ Rechargement du proxy /storage/v1 dans le conteneur web sans rebuild…");
+
   const reload = await exec(conn, `docker cp ${tmpConf} ${cid}:/etc/nginx/conf.d/default.conf && docker exec ${cid} nginx -t && docker exec ${cid} nginx -s reload 2>&1`);
   const reloadOutput = `${reload.stdout}${reload.stderr}`;
   if (reload.code !== 0 || /emerg|failed|error/i.test(reloadOutput)) {

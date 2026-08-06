@@ -194,9 +194,11 @@ async function prepareEarlyWebDeployment(
   log: (m: string) => Promise<void> | void,
 ) {
   const publicAppUrl = resolveBrowserAppBase(body, appPort, false);
-  // Keep the marker in the bundle: the runtime client resolves it to the
-  // browser origin, which works identically through LAN IP, hostname and WAN.
-  const browserSupabaseUrl = supabaseUrl;
+  // A local backend must always be reached through the web container proxy.
+  // The concrete browser origin is intentionally resolved at runtime, so the
+  // same image works through localhost, a LAN IP, a hostname and the WAN URL.
+  const isLocalBackend = projectId === "local";
+  const browserSupabaseUrl = isLocalBackend ? "__SCREENFLOW_SAME_ORIGIN__" : supabaseUrl;
   const quoteYaml = (value: string) => `'${(value || "").replace(/'/g, "''")}'`;
   const compose = `services:
   web:
@@ -2488,13 +2490,16 @@ ${localFunctionLocations}
       - "${appPort}:80"`;
       const publicAppUrl = resolveBrowserAppBase(body, appPort, enableHttps, httpsDomain, httpsPort);
       const appBasePath = body.vite_app_base_path || "/";
+      const browserBackendUrl = installSupabase
+        ? "__SCREENFLOW_SAME_ORIGIN__"
+        : (supabaseUrlOverride || body.vite_supabase_url || publicAppUrl);
       const compose = `services:
   web:
     container_name: screenflow-web
     build:
       context: .
       args:
-        VITE_SUPABASE_URL: '${escEnv(supabaseUrlOverride || body.vite_supabase_url || publicAppUrl)}'
+        VITE_SUPABASE_URL: '${escEnv(browserBackendUrl)}'
         VITE_SUPABASE_PUBLISHABLE_KEY: '${escEnv(supabaseAnonOverride || body.vite_supabase_key || "")}'
         VITE_SUPABASE_PROJECT_ID: '${escEnv(supabaseProjectIdOverride || body.vite_supabase_project_id || "")}'
         VITE_PUBLIC_APP_URL: '${escEnv(publicAppUrl)}'
@@ -2510,7 +2515,7 @@ ${portsBlock}
       await patchRemoteLanOriginFallback(conn, `${remoteDir}/repo`, log);
       await patchRemoteRuntimeSupabaseClient(conn, `${remoteDir}/repo`, log);
       if (installSupabase) {
-        const buildInputCheck = await exec(conn, `set -e; grep -Fq "projectId === 'local'" ${remoteDir}/repo/src/integrations/supabase/runtime-client.ts; grep -Fq 'src/integrations/supabase/runtime-client.ts' ${remoteDir}/repo/vite.config.ts; grep -Eq "VITE_SUPABASE_URL: '[[:space:]]*https?://" ${remoteDir}/repo/docker-compose.yml; grep -Fq "VITE_SUPABASE_PROJECT_ID: 'local'" ${remoteDir}/repo/docker-compose.yml`);
+        const buildInputCheck = await exec(conn, `set -e; grep -Fq "projectId === 'local'" ${remoteDir}/repo/src/integrations/supabase/runtime-client.ts; grep -Fq 'src/integrations/supabase/runtime-client.ts' ${remoteDir}/repo/vite.config.ts; grep -Fq "VITE_SUPABASE_URL: '__SCREENFLOW_SAME_ORIGIN__'" ${remoteDir}/repo/docker-compose.yml; grep -Fq "VITE_SUPABASE_PROJECT_ID: 'local'" ${remoteDir}/repo/docker-compose.yml`);
         if (buildInputCheck.code !== 0) {
           throw new Error("Les invariants du client LAN sont absents des fichiers de build du premier déploiement.");
         }
@@ -3686,8 +3691,13 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
     const anonKey = await readRemoteEnv(conn, `${supaDir}/.env`, "ANON_KEY")
       || await readRemoteEnv(conn, `${supaDir}/.env`, "SUPABASE_PUBLISHABLE_KEY")
       || body.vite_supabase_key || "";
-    const projectId = body.vite_supabase_project_id || "local";
+    const localBackendPresent = (await exec(conn, `[ -f ${supaDir}/docker-compose.yml ] && echo YES || echo NO`)).stdout.includes("YES");
+    // Never reuse the cloud project id when repairing a self-hosted install.
+    // Doing so bakes the WAN address into the image and breaks LAN login on
+    // routers without NAT loopback.
+    const projectId = localBackendPresent ? "local" : (body.vite_supabase_project_id || "");
     const publicBase = resolveBrowserAppBase(body, appPort, false);
+    const browserBackendUrl = localBackendPresent ? "__SCREENFLOW_SAME_ORIGIN__" : publicBase;
     const quoteYaml = (value: string) => `'${(value || "").replace(/'/g, "''")}'`;
     const compose = `services:
   web:
@@ -3695,7 +3705,7 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
     build:
       context: .
       args:
-        VITE_SUPABASE_URL: ${quoteYaml(publicBase)}
+        VITE_SUPABASE_URL: ${quoteYaml(browserBackendUrl)}
         VITE_SUPABASE_PUBLISHABLE_KEY: ${quoteYaml(anonKey)}
         VITE_SUPABASE_PROJECT_ID: ${quoteYaml(projectId)}
         VITE_PUBLIC_APP_URL: ${quoteYaml(publicBase)}
@@ -3714,7 +3724,7 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
 `;
     await uploadFile(conn, `${repoDir}/docker-compose.yml`, Buffer.from(compose));
     await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(buildUploadRepairNginxConf(kongPort)));
-    await log(`✓ Configuration web canonique recréée (conteneur screenflow-web, port ${appPort}, Kong ${kongPort})`);
+    await log(`✓ Configuration web canonique recréée (conteneur screenflow-web, port ${appPort}, Kong ${kongPort}, backend ${localBackendPresent ? "same-origin" : "externe"})`);
     const composeConfig = await exec(conn, `cd ${repoDir} && (docker compose config --quiet || docker-compose config --quiet) 2>&1`);
     if (composeConfig.code !== 0) {
       const detail = `${composeConfig.stdout || ""}${composeConfig.stderr || ""}`.trim().slice(-4000);
@@ -3812,6 +3822,28 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
       const failureLogs = await exec(conn, `cd ${repoDir} && (docker compose logs --tail=120 web || docker-compose logs --tail=120 web) 2>&1 || true`);
       result.cause = `Le conteneur web ne sert pas l'application (Docker ${result.container_state || "absent"}, HTTP ${result.app_http}). ${(failureLogs.stdout || failureLogs.stderr || "").slice(-2500)}`;
       throw new Error(result.cause);
+    }
+
+    // Validate that index.html references a real production entry module and
+    // that Nginx serves it as JavaScript. A plain 200 on index.html can hide a
+    // broken/missing asset and still produce a completely blank browser page.
+    const assetProbe = await exec(conn, `set -e; BASE=http://127.0.0.1:${appPort}; HTML=$(curl -fsS "$BASE/"); ASSET=$(printf '%s' "$HTML" | grep -oE '<script[^>]+src="[^"]+"' | head -1 | sed -E 's/.*src="([^"]+)"/\\1/'); [ -n "$ASSET" ]; case "$ASSET" in http://*|https://*) URL="$ASSET" ;; *) URL="$BASE${'$'}{ASSET#/}"; URL="$BASE/${'$'}{ASSET#/}" ;; esac; CODE=$(curl -sS -m 10 -o /tmp/sf_entry.js -w '%{http_code}' "$URL"); [ "$CODE" = 200 ]; [ -s /tmp/sf_entry.js ]; printf 'OK|%s|%s' "$ASSET" "$(wc -c </tmp/sf_entry.js)"`);
+    result.entry_asset = (assetProbe.stdout || "").trim();
+    if (assetProbe.code !== 0 || !result.entry_asset.startsWith("OK|")) {
+      result.cause = `La page HTML répond, mais son module JavaScript principal est absent ou vide. ${assetProbe.stderr || assetProbe.stdout}`.trim();
+      throw new Error(result.cause);
+    }
+    await log(`✓ Module JavaScript principal réellement servi (${result.entry_asset.split("|")[2] || "taille inconnue"} octets)`);
+
+    if (localBackendPresent && anonKey) {
+      const authProbe = await exec(conn, `curl -sS -m 10 -o /tmp/sf_auth_settings.json -w '%{http_code}' http://127.0.0.1:${appPort}/auth/v1/settings -H ${shQuote(`apikey: ${anonKey}`)} 2>/dev/null || true`);
+      result.auth_http = (authProbe.stdout || "").trim();
+      if (!/^2\d\d$/.test(result.auth_http)) {
+        const detail = await exec(conn, `tail -c 500 /tmp/sf_auth_settings.json 2>/dev/null || true`);
+        result.cause = `L'application web fonctionne, mais son proxy Auth local échoue (HTTP ${result.auth_http || "000"}). ${(detail.stdout || "").trim()}`.trim();
+        throw new Error(result.cause);
+      }
+      await log(`✓ Proxy Auth same-origin validé via le conteneur web (HTTP ${result.auth_http})`);
     }
 
     // HTTP 200 only proves that Nginx returned index.html. Also inspect the

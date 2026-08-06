@@ -64,17 +64,29 @@ function isLocalNetworkHostname(hostname: string) {
   return false;
 }
 
+/**
+ * Hôte d'un projet Supabase managé (cloud). Dans ce cas seulement, l'URL
+ * buildée doit être utilisée telle quelle : il n'existe pas de proxy same-origin.
+ */
+function isManagedSupabaseHost(hostname: string) {
+  return /(^|\.)supabase\.(co|in|net)$/.test(hostname);
+}
+
 function shouldUseRuntimeOrigin(configuredUrl: string) {
   if (isSameOriginSupabaseMarker(configuredUrl)) return true;
   const runtimeOrigin = getRuntimeOrigin();
   if (!runtimeOrigin) return false;
   const runtimeHost = hostnameFromUrl(runtimeOrigin);
   const configuredHost = hostnameFromUrl(configuredUrl);
-  // Servi depuis une adresse LAN : le proxy Nginx expose l'API sur la même
-  // origine. On ignore l'URL publique (WAN) buildée, car le NAT loopback
-  // échoue presque toujours depuis le réseau interne.
-  return isLocalNetworkHostname(runtimeHost) && runtimeHost !== configuredHost;
+  if (!runtimeHost || runtimeHost === configuredHost) return false;
+  // Déploiement auto-hébergé : l'app est servie par le proxy Nginx qui expose
+  // /auth /rest /storage /realtime sur la MÊME origine. On ignore donc l'URL
+  // buildée (LAN comme WAN : IP publique, DNS dynamique ou port différent),
+  // sinon les appels partent vers un hôte injoignable depuis le navigateur.
+  if (!isManagedSupabaseHost(configuredHost)) return true;
+  return isLocalNetworkHostname(runtimeHost);
 }
+
 
 
 export function getSupabaseUrl() {
@@ -116,7 +128,11 @@ export function getPublicAppUrl() {
   const runtimeHost = hostnameFromUrl(runtimeOrigin);
   const configuredHost = hostnameFromUrl(appEnv.publicAppUrl);
 
-  if (isLocalNetworkHostname(runtimeHost) && runtimeOrigin && runtimeHost !== configuredHost) {
+  // L'origine réellement utilisée par le navigateur est toujours joignable
+  // (LAN, IP publique, DNS dynamique, port personnalisé). On la privilégie,
+  // sauf sur l'aperçu Lovable où l'URL publique configurée reste la référence.
+  const isLovablePreview = /(^|\.)lovable(project)?\.(app|dev)$/.test(runtimeHost);
+  if (runtimeOrigin && !isLovablePreview && runtimeHost !== configuredHost) {
     return runtimeOrigin;
   }
 
@@ -128,6 +144,7 @@ export function getPublicAppUrl() {
   }
   return "";
 }
+
 
 /**
  * Construit une URL absolue côté app (ex: pour QR codes, liens player).

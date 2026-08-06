@@ -3851,6 +3851,7 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
       || await readRemoteEnv(conn, `${supaDir}/.env`, "SUPABASE_PUBLISHABLE_KEY")
       || body.vite_supabase_key || "";
     const localBackendPresent = (await exec(conn, `[ -f ${supaDir}/docker-compose.yml ] && echo YES || echo NO`)).stdout.includes("YES");
+    const repairKongUpstream = await detectKongUpstream(conn, remoteDir, kongPort, log);
     // Never reuse the cloud project id when repairing a self-hosted install.
     // Doing so bakes the WAN address into the image and breaks LAN login on
     // routers without NAT loopback.
@@ -3871,7 +3872,7 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
         VITE_APP_BASE_PATH: '/'
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    ports:
+${composeServiceNetworks(repairKongUpstream)}    ports:
       - "${appPort}:80"
     restart: unless-stopped
     healthcheck:
@@ -3880,7 +3881,7 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
       timeout: 5s
       retries: 6
       start_period: 10s
-`;
+${composeTopLevelNetworks(repairKongUpstream)}`;
     await uploadFile(conn, `${repoDir}/docker-compose.yml`, Buffer.from(compose));
     await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(buildUploadRepairNginxConf(kongPort, repairKongUpstream)));
     await log(`✓ Configuration web canonique recréée (conteneur screenflow-web, port ${appPort}, Kong ${kongPort}, backend ${localBackendPresent ? "same-origin" : "externe"})`);
@@ -4458,6 +4459,7 @@ async function runNetworkInspect(body: DeployBody, log: (m: string) => Promise<v
 
     await log("→ Tests du trajet réel navigateur → web → gateway locale…");
     const kongPort = await readRemoteEnv(conn, `${supaDir}/.env`, "KONG_HTTP_PORT") || "8000";
+    const inspectKongUpstream = await detectKongUpstream(conn, remoteDir, kongPort, log);
     const anonKey = await readRemoteEnv(conn, `${supaDir}/.env`, "ANON_KEY")
       || await readRemoteEnv(conn, `${supaDir}/.env`, "SUPABASE_PUBLISHABLE_KEY");
     const webName = (await exec(conn, `cd ${remoteDir}/repo && (docker compose ps -q web || docker-compose ps -q web) 2>/dev/null | head -1`)).stdout.trim();

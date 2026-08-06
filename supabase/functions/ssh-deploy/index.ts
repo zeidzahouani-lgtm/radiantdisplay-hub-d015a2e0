@@ -2195,7 +2195,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
           `${remoteDir}/repo`,
           remoteDir,
           appPort,
-          "__SCREENFLOW_SAME_ORIGIN__",
+          supaBrowserUrl,
           anonKey,
           "local",
           log,
@@ -2319,7 +2319,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
           `${remoteDir}/repo`,
           remoteDir,
           appPort,
-          "__SCREENFLOW_SAME_ORIGIN__",
+          supaBrowserUrl,
           anonKey,
           "local",
           log,
@@ -2494,7 +2494,7 @@ ${localFunctionLocations}
     build:
       context: .
       args:
-        VITE_SUPABASE_URL: '${escEnv(installSupabase ? "__SCREENFLOW_SAME_ORIGIN__" : (supabaseUrlOverride || body.vite_supabase_url || ""))}'
+        VITE_SUPABASE_URL: '${escEnv(supabaseUrlOverride || body.vite_supabase_url || publicAppUrl)}'
         VITE_SUPABASE_PUBLISHABLE_KEY: '${escEnv(supabaseAnonOverride || body.vite_supabase_key || "")}'
         VITE_SUPABASE_PROJECT_ID: '${escEnv(supabaseProjectIdOverride || body.vite_supabase_project_id || "")}'
         VITE_PUBLIC_APP_URL: '${escEnv(publicAppUrl)}'
@@ -2510,7 +2510,7 @@ ${portsBlock}
       await patchRemoteLanOriginFallback(conn, `${remoteDir}/repo`, log);
       await patchRemoteRuntimeSupabaseClient(conn, `${remoteDir}/repo`, log);
       if (installSupabase) {
-        const buildInputCheck = await exec(conn, `set -e; grep -Fq "projectId === 'local'" ${remoteDir}/repo/src/integrations/supabase/runtime-client.ts; grep -Fq 'src/integrations/supabase/runtime-client.ts' ${remoteDir}/repo/vite.config.ts; grep -Fq "VITE_SUPABASE_URL: '__SCREENFLOW_SAME_ORIGIN__'" ${remoteDir}/repo/docker-compose.yml; grep -Fq "VITE_SUPABASE_PROJECT_ID: 'local'" ${remoteDir}/repo/docker-compose.yml`);
+        const buildInputCheck = await exec(conn, `set -e; grep -Fq "projectId === 'local'" ${remoteDir}/repo/src/integrations/supabase/runtime-client.ts; grep -Fq 'src/integrations/supabase/runtime-client.ts' ${remoteDir}/repo/vite.config.ts; grep -Eq "VITE_SUPABASE_URL: '[[:space:]]*https?://" ${remoteDir}/repo/docker-compose.yml; grep -Fq "VITE_SUPABASE_PROJECT_ID: 'local'" ${remoteDir}/repo/docker-compose.yml`);
         if (buildInputCheck.code !== 0) {
           throw new Error("Les invariants du client LAN sont absents des fichiers de build du premier déploiement.");
         }
@@ -2791,7 +2791,7 @@ p = pathlib.Path(${JSON.stringify(`${repoDir}/docker-compose.yml`)})
 s = p.read_text()
 url = base64.b64decode(${JSON.stringify(b64utf8(publicBase))}).decode()
 key = base64.b64decode(${JSON.stringify(b64utf8(anonKey))}).decode()
-s = re.sub(r"VITE_SUPABASE_URL:\\s*.*", "VITE_SUPABASE_URL: '__SCREENFLOW_SAME_ORIGIN__'", s)
+s = re.sub(r"VITE_SUPABASE_URL:\\s*.*", f"VITE_SUPABASE_URL: '{url}'", s)
 s = re.sub(r"VITE_SUPABASE_PUBLISHABLE_KEY:\\s*.*", f"VITE_SUPABASE_PUBLISHABLE_KEY: '{key}'", s)
 s = re.sub(r"VITE_SUPABASE_PROJECT_ID:\\s*.*", "VITE_SUPABASE_PROJECT_ID: 'local'", s)
 if re.search(r"VITE_PUBLIC_APP_URL:\\s*", s):
@@ -2803,7 +2803,7 @@ if re.search(r"VITE_APP_BASE_PATH:\\s*", s):
 else:
     s = re.sub(r"(VITE_PUBLIC_APP_URL:.*\\n)", "\\1        VITE_APP_BASE_PATH: '/'\\n", s)
 required = {
-    "VITE_SUPABASE_URL": "VITE_SUPABASE_URL: '__SCREENFLOW_SAME_ORIGIN__'",
+    "VITE_SUPABASE_URL": "VITE_SUPABASE_URL: '" + url.replace("'", "''") + "'",
     "VITE_SUPABASE_PUBLISHABLE_KEY": "VITE_SUPABASE_PUBLISHABLE_KEY: '" + key + "'",
     "VITE_SUPABASE_PROJECT_ID": "VITE_SUPABASE_PROJECT_ID: 'local'",
     "VITE_PUBLIC_APP_URL": "VITE_PUBLIC_APP_URL: '" + url.replace("'", "''") + "'",
@@ -3695,7 +3695,7 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
     build:
       context: .
       args:
-        VITE_SUPABASE_URL: '__SCREENFLOW_SAME_ORIGIN__'
+        VITE_SUPABASE_URL: ${quoteYaml(publicBase)}
         VITE_SUPABASE_PUBLISHABLE_KEY: ${quoteYaml(anonKey)}
         VITE_SUPABASE_PROJECT_ID: ${quoteYaml(projectId)}
         VITE_PUBLIC_APP_URL: ${quoteYaml(publicBase)}

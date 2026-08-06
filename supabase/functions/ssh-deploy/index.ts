@@ -231,7 +231,8 @@ async function prepareEarlyWebDeployment(
       (await readRemoteEnv(conn, `${remoteDir}/supabase/.env`, "KONG_HTTP_PORT")) ||
       body.supabase_kong_http_port ||
       "8000";
-    await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(buildUploadRepairNginxConf(kongPort)));
+    const earlyKongUpstream = await detectKongUpstream(conn, remoteDir, kongPort, log);
+    await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(buildUploadRepairNginxConf(kongPort, earlyKongUpstream)));
     await log(`✓ nginx.conf absent du dépôt distant : recréé (Kong ${kongPort})`);
   }
 
@@ -2422,17 +2423,23 @@ CMD ["nginx","-g","daemon off;"]
     return 204;
   }`;
 
+      // Upstream Kong : réseau Docker interne en priorité (immunisé au pare-feu
+      // de l'hôte), passerelle hôte seulement en secours.
+      const kongUpstream = await detectKongUpstream(conn, remoteDir, supaKongPort, log);
+      const kongTarget = upstreamAuthority(kongUpstream);
+
       const functionProxyHeaders = `proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Host $host; proxy_set_header X-Forwarded-Proto ${enableHttps ? "https" : "http"}; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host;`;
-      const localFunctionLocations = localFunctions.map((name) => `  location = /functions/v1/${name} { ${corsHidesAndAdds} proxy_pass http://host.docker.internal:${supaKongPort}/functions/v1/${name}; ${functionProxyHeaders} }`).join("\n");
+      const localFunctionLocations = localFunctions.map((name) => `  location = /functions/v1/${name} { ${corsHidesAndAdds} proxy_pass http://${kongTarget}/functions/v1/${name}; ${functionProxyHeaders} }`).join("\n");
 
       // Common proxy snippet shared by all Supabase upstream locations.
       // CRITICAL: client_max_body_size must be large enough for media uploads (videos can be hundreds of MB).
       // proxy_request_buffering off allows streaming large uploads to Kong/Storage without buffering to disk first.
       const commonProxyHeaders = (proto: string) => `${corsHidesAndAdds} proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto ${proto}; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host;`;
-      const storageProxy = (proto: string) => `proxy_pass http://host.docker.internal:${supaKongPort}/storage/v1/; ${commonProxyHeaders(proto)} client_max_body_size 1024m; proxy_request_buffering off; proxy_buffering off; proxy_read_timeout 3600s; proxy_send_timeout 3600s;`;
-      const restProxy = (proto: string) => `proxy_pass http://host.docker.internal:${supaKongPort}/rest/v1/; ${commonProxyHeaders(proto)} client_max_body_size 50m;`;
-      const authProxy = (proto: string) => `proxy_pass http://host.docker.internal:${supaKongPort}/auth/v1/; ${commonProxyHeaders(proto)} client_max_body_size 10m;`;
-      const realtimeProxy = (proto: string) => `proxy_pass http://host.docker.internal:${supaKongPort}/realtime/v1/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; ${commonProxyHeaders(proto)} proxy_read_timeout 3600s; proxy_send_timeout 3600s;`;
+      const storageProxy = (proto: string) => `proxy_pass http://${kongTarget}/storage/v1/; ${commonProxyHeaders(proto)} client_max_body_size 1024m; proxy_request_buffering off; proxy_buffering off; proxy_read_timeout 3600s; proxy_send_timeout 3600s;`;
+      const restProxy = (proto: string) => `proxy_pass http://${kongTarget}/rest/v1/; ${commonProxyHeaders(proto)} client_max_body_size 50m;`;
+      const authProxy = (proto: string) => `proxy_pass http://${kongTarget}/auth/v1/; ${commonProxyHeaders(proto)} client_max_body_size 10m;`;
+      const realtimeProxy = (proto: string) => `proxy_pass http://${kongTarget}/realtime/v1/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; ${commonProxyHeaders(proto)} proxy_read_timeout 3600s; proxy_send_timeout 3600s;`;
+
 
       const nginxConf = enableHttps
         ? `client_max_body_size 1024m;
@@ -2506,9 +2513,10 @@ ${localFunctionLocations}
         VITE_APP_BASE_PATH: '${escEnv(appBasePath)}'
     extra_hosts:
       - "host.docker.internal:host-gateway"
-${portsBlock}
+${composeServiceNetworks(kongUpstream)}${portsBlock}
     restart: unless-stopped
-`;
+${composeTopLevelNetworks(kongUpstream)}`;
+
       await uploadFile(conn, `${remoteDir}/repo/Dockerfile`, Buffer.from(dockerfile));
       await uploadFile(conn, `${remoteDir}/repo/nginx.conf`, Buffer.from(nginxConf));
       await uploadFile(conn, `${remoteDir}/repo/docker-compose.yml`, Buffer.from(compose));
@@ -2786,7 +2794,8 @@ async function repairLocalApiUrlOnExistingDeployment(conn: Client, body: DeployB
   await log(`→ IP LAN réelle retenue : ${localIp}`);
   await log(`→ Réparation URL API navigateur : ${publicBase}`);
 
-  const nginxConf = buildUploadRepairNginxConf(kongPort);
+  const kongUpstream = await detectKongUpstream(conn, remoteDir, kongPort, log);
+  const nginxConf = buildUploadRepairNginxConf(kongPort, kongUpstream);
 
   await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(nginxConf));
   await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
@@ -2849,7 +2858,74 @@ PY`;
   (globalThis as any).__lastDeployResult = { action: "repair_local_api_url", ok: true, url: publicBase, supabase_local: { url: publicBase, anon_key: anonKey } };
 }
 
-function buildUploadRepairNginxConf(kongPort: string) {
+/**
+ * Upstream Kong utilisé par le proxy Nginx du conteneur web.
+ *
+ * `host.docker.internal:<port>` dépend de `host-gateway` ET du pare-feu de
+ * l'hôte (les paquets viennent du bridge Docker). Sur beaucoup de serveurs le
+ * firewall bloque docker0 → Kong, ce qui casse /rest, /storage et /realtime
+ * (bannière « la base de données ne répond pas », uploads KO en LAN comme WAN).
+ * On privilégie donc le réseau Docker de la stack Supabase : `kong:8000`,
+ * strictement interne, sans NAT ni pare-feu.
+ */
+type KongUpstream = { host: string; port: string; network: string | null; via: string };
+
+function upstreamAuthority(u: KongUpstream) {
+  return `${u.host}:${u.port}`;
+}
+
+function composeServiceNetworks(u: KongUpstream) {
+  return u.network ? `    networks:\n      - default\n      - supabase_net\n` : "";
+}
+
+function composeTopLevelNetworks(u: KongUpstream) {
+  return u.network ? `networks:\n  supabase_net:\n    external: true\n    name: ${u.network}\n` : "";
+}
+
+async function detectKongUpstream(
+  conn: Client,
+  remoteDir: string,
+  kongPort: string,
+  log?: (m: string) => Promise<void> | void,
+): Promise<KongUpstream> {
+  const fallback: KongUpstream = {
+    host: "host.docker.internal",
+    port: kongPort,
+    network: null,
+    via: `host.docker.internal:${kongPort} (passerelle hôte)`,
+  };
+  try {
+    const supaDir = `${remoteDir}/supabase`;
+    const out = await exec(
+      conn,
+      `CID=""; if [ -f ${supaDir}/docker-compose.yml ]; then CID=$(cd ${supaDir} && docker compose ps -q kong 2>/dev/null | head -1); fi; ` +
+        `if [ -z "$CID" ]; then CID=$(docker ps --format '{{.ID}} {{.Names}}' | awk 'tolower($0) ~ /kong/ {print $1; exit}'); fi; ` +
+        `if [ -n "$CID" ]; then docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$CID"; fi`,
+    );
+    const network = (out.stdout || "")
+      .trim()
+      .split(/\s+/)
+      .filter((n) => n && !/^(host|none|bridge)$/.test(n))[0] || "";
+    if (!network) {
+      if (log) await log(`⚠ Réseau Docker de Kong non détecté : proxy via ${fallback.via}`);
+      return fallback;
+    }
+    const upstream: KongUpstream = { host: "kong", port: "8000", network, via: `réseau Docker ${network} → kong:8000` };
+    if (log) await log(`✓ Proxy backend via le ${upstream.via} (indépendant du pare-feu hôte)`);
+    return upstream;
+  } catch {
+    return fallback;
+  }
+}
+
+function buildUploadRepairNginxConf(kongPort: string, upstream?: KongUpstream) {
+  const target = upstream ? upstreamAuthority(upstream) : `host.docker.internal:${kongPort}`;
+  return buildUploadRepairNginxConfFor(target);
+}
+
+function buildUploadRepairNginxConfFor(kongTarget: string) {
+  const kongPort = kongTarget;
+
   return `client_max_body_size 1024m;
 server {
   listen 80;
@@ -2871,11 +2947,11 @@ server {
     add_header Content-Length 0 always;
     return 204;
   }
-  location /auth/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/auth/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; }
-  location /rest/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/rest/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; client_max_body_size 50m; }
-  location /storage/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/storage/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; client_max_body_size 1024m; proxy_request_buffering off; proxy_buffering off; proxy_read_timeout 3600s; proxy_send_timeout 3600s; }
-  location /functions/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/functions/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; }
-  location /realtime/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://host.docker.internal:${kongPort}/realtime/v1/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; proxy_read_timeout 3600s; proxy_send_timeout 3600s; }
+  location /auth/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://${kongPort}/auth/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; }
+  location /rest/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://${kongPort}/rest/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; client_max_body_size 50m; }
+  location /storage/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://${kongPort}/storage/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; client_max_body_size 1024m; proxy_request_buffering off; proxy_buffering off; proxy_read_timeout 3600s; proxy_send_timeout 3600s; }
+  location /functions/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://${kongPort}/functions/v1/; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; }
+  location /realtime/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://${kongPort}/realtime/v1/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Proto http; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host; proxy_read_timeout 3600s; proxy_send_timeout 3600s; }
   location /assets/ { expires 1y; add_header Cache-Control "public, immutable"; }
   location = /index.html { add_header Cache-Control "no-store, no-cache, must-revalidate" always; expires -1; }
   location / { add_header Cache-Control "no-cache" always; try_files $uri $uri/ /index.html; }
@@ -2904,7 +2980,8 @@ async function patchRunningWebProxyForUploads(conn: Client, body: DeployBody, ko
   const remoteDir = body.remote_dir || "/opt/screenflow";
   const repoDir = `${remoteDir}/repo`;
   const appPort = body.app_port || "8080";
-  const nginxConf = buildUploadRepairNginxConf(kongPort);
+  const kongUpstream = await detectKongUpstream(conn, remoteDir, kongPort, log);
+  const nginxConf = buildUploadRepairNginxConf(kongPort, kongUpstream);
   const tmpConf = `/tmp/screenflow-upload-fix-${crypto.randomUUID()}.conf`;
   const result: any = { patched: false, ok: false, skipped: false, detail: "" };
 
@@ -2920,7 +2997,18 @@ async function patchRunningWebProxyForUploads(conn: Client, body: DeployBody, ko
     return result;
   }
 
+  // Un proxy vers `kong:8000` n'est résoluble que si le conteneur web est
+  // attaché au réseau Docker de la stack Supabase : on l'attache à chaud.
+  if (kongUpstream.network) {
+    const attach = await exec(conn, `docker network connect ${kongUpstream.network} ${cid} 2>&1 || true`);
+    const attachOut = `${attach.stdout}${attach.stderr}`;
+    await log(/already exists/i.test(attachOut)
+      ? `✓ Conteneur web déjà attaché au réseau ${kongUpstream.network}`
+      : `✓ Conteneur web attaché au réseau ${kongUpstream.network}`);
+  }
+
   await log("→ Rechargement du proxy /storage/v1 dans le conteneur web sans rebuild…");
+
   const reload = await exec(conn, `docker cp ${tmpConf} ${cid}:/etc/nginx/conf.d/default.conf && docker exec ${cid} nginx -t && docker exec ${cid} nginx -s reload 2>&1`);
   const reloadOutput = `${reload.stdout}${reload.stderr}`;
   if (reload.code !== 0 || /emerg|failed|error/i.test(reloadOutput)) {
@@ -3774,6 +3862,7 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
       || await readRemoteEnv(conn, `${supaDir}/.env`, "SUPABASE_PUBLISHABLE_KEY")
       || body.vite_supabase_key || "";
     const localBackendPresent = (await exec(conn, `[ -f ${supaDir}/docker-compose.yml ] && echo YES || echo NO`)).stdout.includes("YES");
+    const repairKongUpstream = await detectKongUpstream(conn, remoteDir, kongPort, log);
     // Never reuse the cloud project id when repairing a self-hosted install.
     // Doing so bakes the WAN address into the image and breaks LAN login on
     // routers without NAT loopback.
@@ -3794,7 +3883,7 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
         VITE_APP_BASE_PATH: '/'
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    ports:
+${composeServiceNetworks(repairKongUpstream)}    ports:
       - "${appPort}:80"
     restart: unless-stopped
     healthcheck:
@@ -3803,9 +3892,9 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
       timeout: 5s
       retries: 6
       start_period: 10s
-`;
+${composeTopLevelNetworks(repairKongUpstream)}`;
     await uploadFile(conn, `${repoDir}/docker-compose.yml`, Buffer.from(compose));
-    await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(buildUploadRepairNginxConf(kongPort)));
+    await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(buildUploadRepairNginxConf(kongPort, repairKongUpstream)));
     await log(`✓ Configuration web canonique recréée (conteneur screenflow-web, port ${appPort}, Kong ${kongPort}, backend ${localBackendPresent ? "same-origin" : "externe"})`);
     const composeConfig = await exec(conn, `cd ${repoDir} && (docker compose config --quiet || docker-compose config --quiet) 2>&1`);
     if (composeConfig.code !== 0) {
@@ -3891,7 +3980,7 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
       await log(result.host_gateway_ok
         ? `✓ host.docker.internal résolu (${(gw.stdout || "").trim().split(/\s+/)[0]})`
         : "✗ host.docker.internal non résolu dans le conteneur web — le proxy vers Kong/Storage ne peut pas fonctionner.");
-      const up = await exec(conn, `docker exec ${cid} sh -c 'wget -q -S -O /dev/null http://host.docker.internal:${kongPort}/storage/v1/bucket 2>&1 | head -3' || true`);
+      const up = await exec(conn, `docker exec ${cid} sh -c 'wget -q -S -O /dev/null http://${upstreamAuthority(repairKongUpstream)}/storage/v1/bucket 2>&1 | head -3' || true`);
       if ((up.stdout || "").trim()) await log("ℹ Test Storage depuis le conteneur web : " + (up.stdout || "").trim().replace(/\s+/g, " ").slice(0, 200));
     }
 
@@ -4381,13 +4470,14 @@ async function runNetworkInspect(body: DeployBody, log: (m: string) => Promise<v
 
     await log("→ Tests du trajet réel navigateur → web → gateway locale…");
     const kongPort = await readRemoteEnv(conn, `${supaDir}/.env`, "KONG_HTTP_PORT") || "8000";
+    const inspectKongUpstream = await detectKongUpstream(conn, remoteDir, kongPort, log);
     const anonKey = await readRemoteEnv(conn, `${supaDir}/.env`, "ANON_KEY")
       || await readRemoteEnv(conn, `${supaDir}/.env`, "SUPABASE_PUBLISHABLE_KEY");
     const webName = (await exec(conn, `cd ${remoteDir}/repo && (docker compose ps -q web || docker-compose ps -q web) 2>/dev/null | head -1`)).stdout.trim();
     const tests: any[] = [];
     if (webName) {
-      const gatewayProbe = await exec(conn, `docker exec ${webName} sh -lc ${shQuote(`wget -q -T 5 -S -O /dev/null --header=${shQuote(`apikey: ${anonKey}`)} http://host.docker.internal:${kongPort}/rest/v1/ 2>&1`)} 2>&1`);
-      tests.push({ from: "web", to: `host.docker.internal:${kongPort}/rest/v1`, ok: gatewayProbe.code === 0, output: `${gatewayProbe.stdout}${gatewayProbe.stderr}`.trim().slice(-300) });
+      const gatewayProbe = await exec(conn, `docker exec ${webName} sh -lc ${shQuote(`wget -q -T 5 -S -O /dev/null --header=${shQuote(`apikey: ${anonKey}`)} http://${upstreamAuthority(inspectKongUpstream)}/rest/v1/ 2>&1`)} 2>&1`);
+      tests.push({ from: "web", to: `${upstreamAuthority(inspectKongUpstream)}/rest/v1`, ok: gatewayProbe.code === 0, output: `${gatewayProbe.stdout}${gatewayProbe.stderr}`.trim().slice(-300) });
       const appPort = body.app_port || "8080";
       const proxyProbe = await exec(conn, `curl -sS -m 5 -o /dev/null -w "%{http_code}" http://127.0.0.1:${appPort}/rest/v1/ -H ${shQuote(`apikey: ${anonKey}`)} -H ${shQuote(`Authorization: Bearer ${anonKey}`)} 2>/dev/null || true`);
       const proxyCode = (proxyProbe.stdout || "").trim();

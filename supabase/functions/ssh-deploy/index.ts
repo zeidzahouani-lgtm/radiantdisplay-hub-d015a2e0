@@ -2512,9 +2512,10 @@ ${localFunctionLocations}
         VITE_APP_BASE_PATH: '${escEnv(appBasePath)}'
     extra_hosts:
       - "host.docker.internal:host-gateway"
-${portsBlock}
+${composeServiceNetworks(kongUpstream)}${portsBlock}
     restart: unless-stopped
-`;
+${composeTopLevelNetworks(kongUpstream)}`;
+
       await uploadFile(conn, `${remoteDir}/repo/Dockerfile`, Buffer.from(dockerfile));
       await uploadFile(conn, `${remoteDir}/repo/nginx.conf`, Buffer.from(nginxConf));
       await uploadFile(conn, `${remoteDir}/repo/docker-compose.yml`, Buffer.from(compose));

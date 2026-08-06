@@ -2595,6 +2595,37 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
     connectivity.app = { ok: /^(200|301|302|304)$/.test(appCode), detail: `HTTP ${appCode} sur ${localAppUrl} (IP LAN réelle)` };
     await log(`  • App         : ${connectivity.app.ok ? "✓" : "✗"} ${connectivity.app.detail}`);
 
+    // A 200 on `/` only proves that Nginx can return index.html. It does not
+    // prove that the SPA entry bundle is present or that the login deep-link
+    // is served correctly. Validate both before announcing a successful deploy.
+    const normalizedBasePath = (body.vite_app_base_path || "/").trim().replace(/^\/+|\/+$/g, "");
+    const loginPath = `${normalizedBasePath ? `/${normalizedBasePath}` : ""}/login`;
+    const frontendProbe = await exec(conn,
+      `set -o pipefail; ` +
+      `BASE=${shQuote(localAppUrl)}; LOGIN=${shQuote(loginPath)}; ` +
+      `HTML=$(curl -kfsS --max-time 15 "$BASE$LOGIN") || { echo 'LOGIN_HTTP_FAILED'; exit 21; }; ` +
+      `printf '%s' "$HTML" | grep -Fq 'id="root"' || { echo 'LOGIN_INDEX_INVALID'; exit 22; }; ` +
+      `ASSET=$(printf '%s' "$HTML" | grep -oE 'src="[^"]+\.js([^"]*)?"' | head -1 | cut -d'"' -f2); ` +
+      `[ -n "$ASSET" ] || { echo 'ENTRY_ASSET_MISSING'; exit 23; }; ` +
+      `case "$ASSET" in http://*|https://*) URL="$ASSET" ;; /*) URL="$BASE$ASSET" ;; *) URL="$BASE/${normalizedBasePath ? `${normalizedBasePath}/` : ""}$ASSET" ;; esac; ` +
+      `CODE=$(curl -kfsS --max-time 20 -o /tmp/screenflow-entry.js -w '%{http_code}' "$URL") || { echo "ENTRY_ASSET_HTTP_FAILED:$URL"; exit 24; }; ` +
+      `[ "$CODE" = '200' ] && [ -s /tmp/screenflow-entry.js ] || { echo "ENTRY_ASSET_INVALID:$CODE:$URL"; exit 25; }; ` +
+      `echo "OK:$LOGIN:$URL"`,
+    );
+    const frontendProbeOutput = `${frontendProbe.stdout || ""}${frontendProbe.stderr || ""}`.trim();
+    connectivity.frontend_login = {
+      ok: frontendProbe.code === 0 && frontendProbeOutput.includes("OK:"),
+      detail: frontendProbeOutput.slice(-500) || `Échec de validation de ${loginPath}`,
+    };
+    await log(`  • Page login  : ${connectivity.frontend_login.ok ? "✓" : "✗"} ${connectivity.frontend_login.detail}`);
+    if (!connectivity.frontend_login.ok) {
+      const webDiagnostic = await exec(conn, `cd ${remoteDir}/repo && docker compose ps web && docker compose logs --tail=120 web 2>&1 || true`);
+      throw new Error(
+        `Le conteneur répond, mais la page de connexion ou son bundle JavaScript n'est pas livrable (${connectivity.frontend_login.detail}). ` +
+        `${(`${webDiagnostic.stdout}${webDiagnostic.stderr}`).slice(-2200)}`,
+      );
+    }
+
     // A loopback success does not prove that the host firewall/provider allows
     // remote traffic. Probe the exact browser URL from outside the SSH server.
     try {

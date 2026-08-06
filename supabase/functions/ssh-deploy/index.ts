@@ -2849,7 +2849,74 @@ PY`;
   (globalThis as any).__lastDeployResult = { action: "repair_local_api_url", ok: true, url: publicBase, supabase_local: { url: publicBase, anon_key: anonKey } };
 }
 
-function buildUploadRepairNginxConf(kongPort: string) {
+/**
+ * Upstream Kong utilisé par le proxy Nginx du conteneur web.
+ *
+ * `host.docker.internal:<port>` dépend de `host-gateway` ET du pare-feu de
+ * l'hôte (les paquets viennent du bridge Docker). Sur beaucoup de serveurs le
+ * firewall bloque docker0 → Kong, ce qui casse /rest, /storage et /realtime
+ * (bannière « la base de données ne répond pas », uploads KO en LAN comme WAN).
+ * On privilégie donc le réseau Docker de la stack Supabase : `kong:8000`,
+ * strictement interne, sans NAT ni pare-feu.
+ */
+type KongUpstream = { host: string; port: string; network: string | null; via: string };
+
+function upstreamAuthority(u: KongUpstream) {
+  return `${u.host}:${u.port}`;
+}
+
+function composeServiceNetworks(u: KongUpstream) {
+  return u.network ? `    networks:\n      - default\n      - supabase_net\n` : "";
+}
+
+function composeTopLevelNetworks(u: KongUpstream) {
+  return u.network ? `networks:\n  supabase_net:\n    external: true\n    name: ${u.network}\n` : "";
+}
+
+async function detectKongUpstream(
+  conn: Client,
+  remoteDir: string,
+  kongPort: string,
+  log?: (m: string) => Promise<void> | void,
+): Promise<KongUpstream> {
+  const fallback: KongUpstream = {
+    host: "host.docker.internal",
+    port: kongPort,
+    network: null,
+    via: `host.docker.internal:${kongPort} (passerelle hôte)`,
+  };
+  try {
+    const supaDir = `${remoteDir}/supabase`;
+    const out = await exec(
+      conn,
+      `CID=""; if [ -f ${supaDir}/docker-compose.yml ]; then CID=$(cd ${supaDir} && docker compose ps -q kong 2>/dev/null | head -1); fi; ` +
+        `if [ -z "$CID" ]; then CID=$(docker ps --format '{{.ID}} {{.Names}}' | awk 'tolower($0) ~ /kong/ {print $1; exit}'); fi; ` +
+        `if [ -n "$CID" ]; then docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$CID"; fi`,
+    );
+    const network = (out.stdout || "")
+      .trim()
+      .split(/\s+/)
+      .filter((n) => n && !/^(host|none|bridge)$/.test(n))[0] || "";
+    if (!network) {
+      if (log) await log(`⚠ Réseau Docker de Kong non détecté : proxy via ${fallback.via}`);
+      return fallback;
+    }
+    const upstream: KongUpstream = { host: "kong", port: "8000", network, via: `réseau Docker ${network} → kong:8000` };
+    if (log) await log(`✓ Proxy backend via le ${upstream.via} (indépendant du pare-feu hôte)`);
+    return upstream;
+  } catch {
+    return fallback;
+  }
+}
+
+function buildUploadRepairNginxConf(kongPort: string, upstream?: KongUpstream) {
+  const target = upstream ? upstreamAuthority(upstream) : `host.docker.internal:${kongPort}`;
+  return buildUploadRepairNginxConfFor(target);
+}
+
+function buildUploadRepairNginxConfFor(kongTarget: string) {
+  const kongPort = kongTarget;
+
   return `client_max_body_size 1024m;
 server {
   listen 80;

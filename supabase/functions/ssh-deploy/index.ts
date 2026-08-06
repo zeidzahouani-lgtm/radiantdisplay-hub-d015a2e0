@@ -3181,9 +3181,11 @@ async function runRepairLocalWrites(body: DeployBody, log: (m: string) => Promis
     if (anonKey) {
       await repairLocalApiUrlOnExistingDeployment(conn, body, kongPort, anonKey, log);
     }
-    await log("✓ Réparation upload/écrans appliquée. Rechargez l'application déployée en HTTP puis retestez.");
+    const originFix = await applyBrowserOriginBackendFix(conn, body, remoteDir, log);
+    await log("✓ Réparation upload/écrans appliquée (API et liens suivent l'origine du navigateur : LAN, IP publique, DNS dynamique). Rechargez l'application déployée puis retestez.");
     const repairedUrl = resolveBrowserAppBase(body, body.app_port || "8080");
-    (globalThis as any).__lastDeployResult = { action: "repair_local_writes", ok: true, url: repairedUrl, supabase_local: anonKey ? { url: repairedUrl, anon_key: anonKey } : null };
+    (globalThis as any).__lastDeployResult = { action: "repair_local_writes", ok: true, url: repairedUrl, origin_fix: originFix, supabase_local: anonKey ? { url: repairedUrl, anon_key: anonKey } : null };
+
   } finally {
     try { conn.end(); } catch (_) {}
   }

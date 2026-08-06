@@ -3915,22 +3915,26 @@ async function runRepairRealtime(body: DeployBody, log: (m: string) => Promise<v
     // connexion de la machine vers sa propre IP LAN (hairpin) peut retourner
     // curl 000 alors que Kong et Realtime sont parfaitement accessibles aux clients.
     const detectedLan = (await exec(conn, `hostname -I 2>/dev/null | tr ' ' '\n' | awk '/^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/ {print; exit}'`)).stdout.trim() || "127.0.0.1";
+    const configuredKongPort = (await readRemoteEnv(conn, `${supaDir}/.env`, "KONG_HTTP_PORT")) || "8000";
+    const publishedKongPortResult = await exec(conn, `cd ${supaDir} && (docker compose port kong 8000 2>/dev/null || docker-compose port kong 8000 2>/dev/null || true) | tail -1 | sed 's/.*://'`);
+    const publishedKongPort = (publishedKongPortResult.stdout || "").trim();
+    const kongPort = /^\d+$/.test(publishedKongPort) ? publishedKongPort : configuredKongPort;
     let wsOk = false;
     let wsDetail = "";
     let workingProbeHost = "";
-    const probeHosts = ["127.0.0.1", "localhost"];
+    const probeOrigins = [`http://127.0.0.1:${kongPort}`];
     for (let i = 0; i < 10; i++) {
-      for (const probeHost of probeHosts) {
+      for (const probeOrigin of probeOrigins) {
         const probe = await exec(
           conn,
-          `curl --http1.1 -sS -o /dev/null -w '%{http_code}' --connect-timeout 3 -m 8 -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' 'http://${probeHost}/realtime/v1/websocket?apikey=test&vsn=1.0.0' 2>/dev/null || true`,
+          `curl --http1.1 -sS -o /dev/null -w '%{http_code}' --connect-timeout 3 -m 8 -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' '${probeOrigin}/realtime/v1/websocket?apikey=test&vsn=1.0.0' 2>/dev/null || true`,
         );
         wsDetail = (probe.stdout || "").trim();
         // 101 = upgrade accepté. 400/401/403/404 = proxy et service atteints,
         // la fausse clé ou la version du protocole a simplement été rejetée.
         if (["101", "400", "401", "403", "404"].includes(wsDetail)) {
           wsOk = true;
-          workingProbeHost = probeHost;
+          workingProbeHost = probeOrigin;
           break;
         }
       }
@@ -3942,7 +3946,7 @@ async function runRepairRealtime(body: DeployBody, log: (m: string) => Promise<v
       await log((state.stdout || "").split("\n").slice(-20).join("\n"));
       const logs = await exec(conn, `cd ${supaDir} && (docker compose logs --tail=40 realtime kong || docker-compose logs --tail=40 realtime kong) 2>&1`);
       await log((logs.stdout || "").split("\n").slice(-40).join("\n"));
-      throw new Error(`Realtime injoignable via le proxy local /realtime/v1/websocket (code ${wsDetail || "000"})`);
+      throw new Error(`Realtime injoignable via Kong sur 127.0.0.1:${kongPort}/realtime/v1/websocket (code ${wsDetail || "000"}). Vérifiez le port publié et les logs Kong/Realtime ci-dessus.`);
     }
 
     const lanProbe = await exec(conn, `curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 3 -m 6 'http://${detectedLan}/auth/v1/health' 2>/dev/null || true`);

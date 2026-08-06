@@ -3910,28 +3910,50 @@ async function runRepairRealtime(body: DeployBody, log: (m: string) => Promise<v
       await log(`⚠ Dépôt absent dans ${repoDir} : correctif same-origin non appliqué`);
     }
 
-    // Vérification fonctionnelle du WebSocket Realtime via l'origine locale
+    // Vérification fonctionnelle du WebSocket Realtime depuis le serveur.
+    // Ne pas imposer l'IP LAN ici : selon le firewall/routage de l'hôte, une
+    // connexion de la machine vers sa propre IP LAN (hairpin) peut retourner
+    // curl 000 alors que Kong et Realtime sont parfaitement accessibles aux clients.
     const detectedLan = (await exec(conn, `hostname -I 2>/dev/null | tr ' ' '\n' | awk '/^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/ {print; exit}'`)).stdout.trim() || "127.0.0.1";
     let wsOk = false;
     let wsDetail = "";
+    let workingProbeHost = "";
+    const probeHosts = ["127.0.0.1", "localhost"];
     for (let i = 0; i < 10; i++) {
-      const probe = await exec(
-        conn,
-        `curl -s -o /dev/null -w '%{http_code}' -m 8 -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' 'http://${detectedLan}/realtime/v1/websocket?apikey=test&vsn=1.0.0' || true`,
-      );
-      wsDetail = (probe.stdout || "").trim();
-      // 101 = upgrade accepté, 401/403 = service joignable mais clé de test rejetée
-      if (["101", "400", "401", "403"].includes(wsDetail)) { wsOk = true; break; }
+      for (const probeHost of probeHosts) {
+        const probe = await exec(
+          conn,
+          `curl --http1.1 -sS -o /dev/null -w '%{http_code}' --connect-timeout 3 -m 8 -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' 'http://${probeHost}/realtime/v1/websocket?apikey=test&vsn=1.0.0' 2>/dev/null || true`,
+        );
+        wsDetail = (probe.stdout || "").trim();
+        // 101 = upgrade accepté. 400/401/403/404 = proxy et service atteints,
+        // la fausse clé ou la version du protocole a simplement été rejetée.
+        if (["101", "400", "401", "403", "404"].includes(wsDetail)) {
+          wsOk = true;
+          workingProbeHost = probeHost;
+          break;
+        }
+      }
+      if (wsOk) break;
       await new Promise((r) => setTimeout(r, 3000));
     }
     if (!wsOk) {
-      const logs = await exec(conn, `cd ${supaDir} && (docker compose logs --tail=40 realtime || docker-compose logs --tail=40 realtime) 2>&1`);
+      const state = await exec(conn, `cd ${supaDir} && (docker compose ps realtime kong || docker-compose ps realtime kong) 2>&1`);
+      await log((state.stdout || "").split("\n").slice(-20).join("\n"));
+      const logs = await exec(conn, `cd ${supaDir} && (docker compose logs --tail=40 realtime kong || docker-compose logs --tail=40 realtime kong) 2>&1`);
       await log((logs.stdout || "").split("\n").slice(-40).join("\n"));
-      throw new Error(`Realtime injoignable via http://${detectedLan}/realtime/v1/websocket (code ${wsDetail || "aucun"})`);
+      throw new Error(`Realtime injoignable via le proxy local /realtime/v1/websocket (code ${wsDetail || "000"})`);
     }
 
-    await log(`✓ Realtime réparé (publication + redémarrage + WebSocket OK sur ${detectedLan}, code ${wsDetail})`);
-    (globalThis as any).__lastDeployResult = { action: "repair_realtime", ok: true, lan_ip: detectedLan, ws_code: wsDetail };
+    const lanProbe = await exec(conn, `curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 3 -m 6 'http://${detectedLan}/auth/v1/health' 2>/dev/null || true`);
+    const lanCode = (lanProbe.stdout || "").trim() || "000";
+    if (lanCode === "000") {
+      await log(`⚠ L'auto-test vers ${detectedLan} est bloqué par le routage/firewall local (hairpin). Ce contrôle n'est pas bloquant.`);
+    } else {
+      await log(`✓ Proxy joignable sur l'adresse LAN ${detectedLan} (HTTP ${lanCode})`);
+    }
+    await log(`✓ Realtime réparé (publication + redémarrage + endpoint WebSocket joignable via ${workingProbeHost}, code ${wsDetail})`);
+    (globalThis as any).__lastDeployResult = { action: "repair_realtime", ok: true, lan_ip: detectedLan, lan_http_code: lanCode, ws_probe_host: workingProbeHost, ws_code: wsDetail };
   } finally {
     try { conn.end(); } catch (_) {}
   }

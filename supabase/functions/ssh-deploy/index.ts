@@ -200,6 +200,11 @@ async function prepareEarlyWebDeployment(
   const isLocalBackend = projectId === "local";
   const browserSupabaseUrl = isLocalBackend ? "__SCREENFLOW_SAME_ORIGIN__" : supabaseUrl;
   const quoteYaml = (value: string) => `'${(value || "").replace(/'/g, "''")}'`;
+  const kongPort =
+    (await readRemoteEnv(conn, `${remoteDir}/supabase/.env`, "KONG_HTTP_PORT")) ||
+    body.supabase_kong_http_port ||
+    "8000";
+  const earlyKongUpstream = await detectKongUpstream(conn, remoteDir, kongPort, log);
   const compose = `services:
   web:
     container_name: screenflow-web
@@ -213,28 +218,19 @@ async function prepareEarlyWebDeployment(
         VITE_APP_BASE_PATH: '/'
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    ports:
+${composeServiceNetworks(earlyKongUpstream)}    ports:
       - "${appPort}:80"
     restart: unless-stopped
-`;
+${composeTopLevelNetworks(earlyKongUpstream)}`;
   await uploadFile(conn, `${repoDir}/docker-compose.yml`, Buffer.from(compose));
   await patchRemoteBuildEntrypoint(conn, repoDir, log);
   await patchRemoteLanOriginFallback(conn, repoDir, log);
   await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
 
-  // A remote branch (or a shallow/partial clone) may not ship nginx.conf.
-  // Recreate a canonical proxy config instead of aborting the deployment:
-  // the definitive one is rewritten later with the resolved Kong port.
-  const hasNginx = await exec(conn, `[ -f ${repoDir}/nginx.conf ] && echo OK || echo NO`);
-  if (!(hasNginx.stdout || "").includes("OK")) {
-    const kongPort =
-      (await readRemoteEnv(conn, `${remoteDir}/supabase/.env`, "KONG_HTTP_PORT")) ||
-      body.supabase_kong_http_port ||
-      "8000";
-    const earlyKongUpstream = await detectKongUpstream(conn, remoteDir, kongPort, log);
-    await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(buildUploadRepairNginxConf(kongPort, earlyKongUpstream)));
-    await log(`✓ nginx.conf absent du dépôt distant : recréé (Kong ${kongPort})`);
-  }
+  // Never trust an older repository nginx.conf here: a fresh installation must
+  // already contain the same Auth/REST/Storage/Realtime proxy as the repair path.
+  await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(buildUploadRepairNginxConf(kongPort, earlyKongUpstream)));
+  await log(`✓ Proxy web canonique préparé dès l'installation (${earlyKongUpstream.via})`);
 
   const required = await exec(conn, `[ -f ${repoDir}/Dockerfile ] && [ -f ${repoDir}/nginx.conf ] && echo OK || echo NO`);
   if (!(required.stdout || "").includes("OK")) {
@@ -2392,7 +2388,7 @@ ENV VITE_SUPABASE_PUBLISHABLE_KEY=$VITE_SUPABASE_PUBLISHABLE_KEY
 ENV VITE_SUPABASE_PROJECT_ID=$VITE_SUPABASE_PROJECT_ID
 ENV VITE_PUBLIC_APP_URL=$VITE_PUBLIC_APP_URL
 ENV VITE_APP_BASE_PATH=$VITE_APP_BASE_PATH
-RUN npm run build
+RUN npm run build -- --mode selfhosted
 FROM nginx:alpine
 COPY --from=builder /app/dist /usr/share/nginx/html
 COPY nginx.conf /etc/nginx/conf.d/default.conf

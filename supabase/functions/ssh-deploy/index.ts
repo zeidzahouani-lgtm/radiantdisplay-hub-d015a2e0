@@ -194,9 +194,11 @@ async function prepareEarlyWebDeployment(
   log: (m: string) => Promise<void> | void,
 ) {
   const publicAppUrl = resolveBrowserAppBase(body, appPort, false);
-  // Keep the marker in the bundle: the runtime client resolves it to the
-  // browser origin, which works identically through LAN IP, hostname and WAN.
-  const browserSupabaseUrl = supabaseUrl;
+  // A local backend must always be reached through the web container proxy.
+  // The concrete browser origin is intentionally resolved at runtime, so the
+  // same image works through localhost, a LAN IP, a hostname and the WAN URL.
+  const isLocalBackend = projectId === "local";
+  const browserSupabaseUrl = isLocalBackend ? "__SCREENFLOW_SAME_ORIGIN__" : supabaseUrl;
   const quoteYaml = (value: string) => `'${(value || "").replace(/'/g, "''")}'`;
   const compose = `services:
   web:
@@ -3686,7 +3688,12 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
     const anonKey = await readRemoteEnv(conn, `${supaDir}/.env`, "ANON_KEY")
       || await readRemoteEnv(conn, `${supaDir}/.env`, "SUPABASE_PUBLISHABLE_KEY")
       || body.vite_supabase_key || "";
-    const projectId = body.vite_supabase_project_id || "local";
+    const localBackendPresent = (await exec(conn, `[ -f ${supaDir}/docker-compose.yml ] && echo YES || echo NO`)).stdout.includes("YES");
+    // Never reuse the cloud project id when repairing a self-hosted install.
+    // Doing so bakes the WAN address into the image and breaks LAN login on
+    // routers without NAT loopback.
+    const projectId = localBackendPresent ? "local" : (body.vite_supabase_project_id || "");
+    const browserBackendUrl = localBackendPresent ? "__SCREENFLOW_SAME_ORIGIN__" : publicBase;
     const publicBase = resolveBrowserAppBase(body, appPort, false);
     const quoteYaml = (value: string) => `'${(value || "").replace(/'/g, "''")}'`;
     const compose = `services:
@@ -3695,7 +3702,7 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
     build:
       context: .
       args:
-        VITE_SUPABASE_URL: ${quoteYaml(publicBase)}
+        VITE_SUPABASE_URL: ${quoteYaml(browserBackendUrl)}
         VITE_SUPABASE_PUBLISHABLE_KEY: ${quoteYaml(anonKey)}
         VITE_SUPABASE_PROJECT_ID: ${quoteYaml(projectId)}
         VITE_PUBLIC_APP_URL: ${quoteYaml(publicBase)}
@@ -3714,7 +3721,7 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
 `;
     await uploadFile(conn, `${repoDir}/docker-compose.yml`, Buffer.from(compose));
     await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(buildUploadRepairNginxConf(kongPort)));
-    await log(`✓ Configuration web canonique recréée (conteneur screenflow-web, port ${appPort}, Kong ${kongPort})`);
+    await log(`✓ Configuration web canonique recréée (conteneur screenflow-web, port ${appPort}, Kong ${kongPort}, backend ${localBackendPresent ? "same-origin" : "externe"})`);
     const composeConfig = await exec(conn, `cd ${repoDir} && (docker compose config --quiet || docker-compose config --quiet) 2>&1`);
     if (composeConfig.code !== 0) {
       const detail = `${composeConfig.stdout || ""}${composeConfig.stderr || ""}`.trim().slice(-4000);

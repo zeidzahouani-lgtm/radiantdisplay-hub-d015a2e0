@@ -2422,17 +2422,23 @@ CMD ["nginx","-g","daemon off;"]
     return 204;
   }`;
 
+      // Upstream Kong : réseau Docker interne en priorité (immunisé au pare-feu
+      // de l'hôte), passerelle hôte seulement en secours.
+      const kongUpstream = await detectKongUpstream(conn, remoteDir, supaKongPort, log);
+      const kongTarget = upstreamAuthority(kongUpstream);
+
       const functionProxyHeaders = `proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Host $host; proxy_set_header X-Forwarded-Proto ${enableHttps ? "https" : "http"}; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host;`;
-      const localFunctionLocations = localFunctions.map((name) => `  location = /functions/v1/${name} { ${corsHidesAndAdds} proxy_pass http://host.docker.internal:${supaKongPort}/functions/v1/${name}; ${functionProxyHeaders} }`).join("\n");
+      const localFunctionLocations = localFunctions.map((name) => `  location = /functions/v1/${name} { ${corsHidesAndAdds} proxy_pass http://${kongTarget}/functions/v1/${name}; ${functionProxyHeaders} }`).join("\n");
 
       // Common proxy snippet shared by all Supabase upstream locations.
       // CRITICAL: client_max_body_size must be large enough for media uploads (videos can be hundreds of MB).
       // proxy_request_buffering off allows streaming large uploads to Kong/Storage without buffering to disk first.
       const commonProxyHeaders = (proto: string) => `${corsHidesAndAdds} proxy_set_header Host $host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto ${proto}; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $host;`;
-      const storageProxy = (proto: string) => `proxy_pass http://host.docker.internal:${supaKongPort}/storage/v1/; ${commonProxyHeaders(proto)} client_max_body_size 1024m; proxy_request_buffering off; proxy_buffering off; proxy_read_timeout 3600s; proxy_send_timeout 3600s;`;
-      const restProxy = (proto: string) => `proxy_pass http://host.docker.internal:${supaKongPort}/rest/v1/; ${commonProxyHeaders(proto)} client_max_body_size 50m;`;
-      const authProxy = (proto: string) => `proxy_pass http://host.docker.internal:${supaKongPort}/auth/v1/; ${commonProxyHeaders(proto)} client_max_body_size 10m;`;
-      const realtimeProxy = (proto: string) => `proxy_pass http://host.docker.internal:${supaKongPort}/realtime/v1/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; ${commonProxyHeaders(proto)} proxy_read_timeout 3600s; proxy_send_timeout 3600s;`;
+      const storageProxy = (proto: string) => `proxy_pass http://${kongTarget}/storage/v1/; ${commonProxyHeaders(proto)} client_max_body_size 1024m; proxy_request_buffering off; proxy_buffering off; proxy_read_timeout 3600s; proxy_send_timeout 3600s;`;
+      const restProxy = (proto: string) => `proxy_pass http://${kongTarget}/rest/v1/; ${commonProxyHeaders(proto)} client_max_body_size 50m;`;
+      const authProxy = (proto: string) => `proxy_pass http://${kongTarget}/auth/v1/; ${commonProxyHeaders(proto)} client_max_body_size 10m;`;
+      const realtimeProxy = (proto: string) => `proxy_pass http://${kongTarget}/realtime/v1/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; ${commonProxyHeaders(proto)} proxy_read_timeout 3600s; proxy_send_timeout 3600s;`;
+
 
       const nginxConf = enableHttps
         ? `client_max_body_size 1024m;

@@ -2490,13 +2490,16 @@ ${localFunctionLocations}
       - "${appPort}:80"`;
       const publicAppUrl = resolveBrowserAppBase(body, appPort, enableHttps, httpsDomain, httpsPort);
       const appBasePath = body.vite_app_base_path || "/";
+      const browserBackendUrl = installSupabase
+        ? "__SCREENFLOW_SAME_ORIGIN__"
+        : (supabaseUrlOverride || body.vite_supabase_url || publicAppUrl);
       const compose = `services:
   web:
     container_name: screenflow-web
     build:
       context: .
       args:
-        VITE_SUPABASE_URL: '${escEnv(supabaseUrlOverride || body.vite_supabase_url || publicAppUrl)}'
+        VITE_SUPABASE_URL: '${escEnv(browserBackendUrl)}'
         VITE_SUPABASE_PUBLISHABLE_KEY: '${escEnv(supabaseAnonOverride || body.vite_supabase_key || "")}'
         VITE_SUPABASE_PROJECT_ID: '${escEnv(supabaseProjectIdOverride || body.vite_supabase_project_id || "")}'
         VITE_PUBLIC_APP_URL: '${escEnv(publicAppUrl)}'

@@ -128,7 +128,11 @@ export function getPublicAppUrl() {
   const runtimeHost = hostnameFromUrl(runtimeOrigin);
   const configuredHost = hostnameFromUrl(appEnv.publicAppUrl);
 
-  if (isLocalNetworkHostname(runtimeHost) && runtimeOrigin && runtimeHost !== configuredHost) {
+  // L'origine réellement utilisée par le navigateur est toujours joignable
+  // (LAN, IP publique, DNS dynamique, port personnalisé). On la privilégie,
+  // sauf sur l'aperçu Lovable où l'URL publique configurée reste la référence.
+  const isLovablePreview = /(^|\.)lovable(project)?\.(app|dev)$/.test(runtimeHost);
+  if (runtimeOrigin && !isLovablePreview && runtimeHost !== configuredHost) {
     return runtimeOrigin;
   }
 
@@ -140,6 +144,7 @@ export function getPublicAppUrl() {
   }
   return "";
 }
+
 
 /**
  * Construit une URL absolue côté app (ex: pour QR codes, liens player).

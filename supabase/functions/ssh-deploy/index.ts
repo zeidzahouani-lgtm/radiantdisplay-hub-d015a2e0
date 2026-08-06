@@ -2993,6 +2993,84 @@ async function ensureWebContainerRunning(conn: Client, repoDir: string, log: (m:
   return Boolean((again.stdout || "").trim());
 }
 
+/**
+ * Correctif LAN/WAN : tout appel backend (Auth, REST, Storage, Realtime) doit
+ * partir de l'origine réellement utilisée par le navigateur, jamais de l'URL
+ * bakée au build. Sans ça, l'upload (XHR direct vers /storage/v1) échoue en WAN
+ * alors que le login fonctionne. Ce correctif est partagé par les boutons
+ * « Corriger uploads sans redéploiement » et « Réparer upload/écrans ».
+ */
+async function applyBrowserOriginBackendFix(
+  conn: Client,
+  body: DeployBody,
+  remoteDir: string,
+  log: (m: string) => Promise<void> | void,
+) {
+  const repoDir = `${remoteDir}/repo`;
+  const info: any = { synced: false, invariants_ok: false, rebuilt: false, detail: "" };
+
+  const repoPresent = (await exec(conn, `[ -d ${repoDir}/.git ] && echo OK || echo NO`)).stdout.includes("OK");
+  if (!repoPresent) {
+    info.detail = `Aucun dépôt cloné dans ${repoDir}`;
+    await log("⚠ Correctif origine navigateur ignoré : dépôt distant absent.");
+    return info;
+  }
+
+  const branch = body.git_branch || "main";
+  const cleanUrl = normalizeGitUrl(body.git_url || "");
+  if (cleanUrl) {
+    const authUrl = withGitToken(cleanUrl, body.git_token?.trim());
+    await exec(conn, `cd ${repoDir} && git remote set-url origin '${authUrl}' 2>&1`);
+  }
+  const pull = await exec(
+    conn,
+    `cd ${repoDir} && (git fetch --depth 1 origin ${branch} && git reset --hard origin/${branch} && git clean -fd -e docker-compose.yml -e ssl) 2>&1 | tail -n 5`,
+  );
+  info.synced = pull.code === 0;
+  await log(info.synced ? `✓ Dépôt distant synchronisé (origin/${branch})` : "⚠ git indisponible — patch appliqué sur les sources présentes");
+
+  await patchRemoteBuildEntrypoint(conn, repoDir, log);
+  await patchRemoteLanOriginFallback(conn, repoDir, log);
+  await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
+
+  // Invariants du correctif WAN : self-hosted ⇒ origine navigateur pour l'API
+  // et pour les URLs générées (QR, liens player).
+  const check = await exec(
+    conn,
+    `f=${repoDir}/src/lib/env.ts; ` +
+      `if [ -f "$f" ] && grep -Fq 'isManagedSupabaseHost' "$f" && grep -Fq 'isLovablePreview' "$f"; then echo INVARIANTS_OK; else echo INVARIANTS_MISSING; fi`,
+  );
+  info.invariants_ok = (check.stdout || "").includes("INVARIANTS_OK");
+  await log(
+    info.invariants_ok
+      ? "✓ Origine navigateur active pour Storage/REST/Auth et pour les liens générés (LAN, IP publique, DNS dynamique)"
+      : "⚠ src/lib/env.ts distant obsolète : lancez « Mise à jour rapide » avec la bonne URL de dépôt pour récupérer le correctif WAN",
+  );
+
+  const webPresent = (await exec(conn, `[ -f ${repoDir}/docker-compose.yml ] && echo OK || echo NO`)).stdout.includes("OK");
+  if (info.invariants_ok && webPresent) {
+    await log("→ Reconstruction du conteneur web pour livrer le correctif d'origine…");
+    const stateDir = `${remoteDir}/.build`;
+    try {
+      await startDetachedCompose(conn, repoDir, stateDir);
+      const res = await pollDetachedCompose(conn, stateDir, Date.now() + 3.5 * 60 * 1000, log);
+      if (!res.done) {
+        await log("⏳ Rebuild web toujours en cours — utilisez « Vérifier le build » pour suivre la fin.");
+      } else {
+        info.rebuilt = res.code === 0;
+        await log(info.rebuilt ? "✓ Conteneur web reconstruit avec le correctif d'origine" : "✗ Rebuild web en erreur :\n" + res.tail.slice(-1200));
+      }
+    } catch (e: any) {
+      info.detail = e?.message || String(e);
+      await log("⚠ Rebuild web impossible : " + info.detail);
+    }
+  }
+
+  return info;
+}
+
+
+
 async function repairUploadsNowCore(conn: Client, body: DeployBody, log: (m: string) => Promise<void> | void) {
 
   const remoteDir = body.remote_dir || "/opt/screenflow";
@@ -3035,13 +3113,15 @@ async function repairUploadsNowCore(conn: Client, body: DeployBody, log: (m: str
   }
 
   const proxy = await patchRunningWebProxyForUploads(conn, body, kongPort, anonKey, supaDir, log);
+  const originFix = await applyBrowserOriginBackendFix(conn, body, remoteDir, log);
   const url = resolveBrowserAppBase(body, body.app_port || "8080");
   const ok = storageTests.every((test) => test.ok) && (proxy.ok || proxy.skipped);
-  const result = { action: "repair_uploads_now", ok, url, storage_service: storageService, storage_tests: storageTests, proxy, supabase_local: { url, anon_key: anonKey } };
+  const result = { action: "repair_uploads_now", ok, url, storage_service: storageService, storage_tests: storageTests, proxy, origin_fix: originFix, supabase_local: { url, anon_key: anonKey } };
 
   await log(ok
-    ? "✓ Uploads bibliothèque + QR corrigés. Rechargez l'application locale puis retestez."
+    ? "✓ Uploads bibliothèque + QR corrigés (LAN et WAN sur l'origine du navigateur). Rechargez l'application puis retestez."
     : "⚠ Réparation appliquée mais un test d'upload échoue encore — copiez le journal ci-dessus pour identifier le blocage exact.");
+
   return result;
 }
 
@@ -3101,9 +3181,11 @@ async function runRepairLocalWrites(body: DeployBody, log: (m: string) => Promis
     if (anonKey) {
       await repairLocalApiUrlOnExistingDeployment(conn, body, kongPort, anonKey, log);
     }
-    await log("✓ Réparation upload/écrans appliquée. Rechargez l'application déployée en HTTP puis retestez.");
+    const originFix = await applyBrowserOriginBackendFix(conn, body, remoteDir, log);
+    await log("✓ Réparation upload/écrans appliquée (API et liens suivent l'origine du navigateur : LAN, IP publique, DNS dynamique). Rechargez l'application déployée puis retestez.");
     const repairedUrl = resolveBrowserAppBase(body, body.app_port || "8080");
-    (globalThis as any).__lastDeployResult = { action: "repair_local_writes", ok: true, url: repairedUrl, supabase_local: anonKey ? { url: repairedUrl, anon_key: anonKey } : null };
+    (globalThis as any).__lastDeployResult = { action: "repair_local_writes", ok: true, url: repairedUrl, origin_fix: originFix, supabase_local: anonKey ? { url: repairedUrl, anon_key: anonKey } : null };
+
   } finally {
     try { conn.end(); } catch (_) {}
   }

@@ -3696,8 +3696,8 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
     // Doing so bakes the WAN address into the image and breaks LAN login on
     // routers without NAT loopback.
     const projectId = localBackendPresent ? "local" : (body.vite_supabase_project_id || "");
-    const browserBackendUrl = localBackendPresent ? "__SCREENFLOW_SAME_ORIGIN__" : publicBase;
     const publicBase = resolveBrowserAppBase(body, appPort, false);
+    const browserBackendUrl = localBackendPresent ? "__SCREENFLOW_SAME_ORIGIN__" : publicBase;
     const quoteYaml = (value: string) => `'${(value || "").replace(/'/g, "''")}'`;
     const compose = `services:
   web:

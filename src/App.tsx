@@ -12,9 +12,9 @@ import { useAppSettings } from "@/hooks/useAppSettings";
 import { EstablishmentProvider } from "@/contexts/EstablishmentContext";
 import { ThemeProvider } from "@/contexts/ThemeContext";
 import NotFound from "./pages/NotFound";
+import Login from "./pages/Login";
 
 const Player = lazy(() => import("./pages/Player"));
-const Login = lazy(() => import("./pages/Login"));
 const Register = lazy(() => import("./pages/Register"));
 const ForgotPassword = lazy(() => import("./pages/ForgotPassword"));
 const ResetPassword = lazy(() => import("./pages/ResetPassword"));

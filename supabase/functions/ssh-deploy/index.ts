@@ -3897,12 +3897,45 @@ async function runRepairRealtime(body: DeployBody, log: (m: string) => Promise<v
     `;
     const out = await exec(conn, dockerPsqlExec(supaDir, sql));
     await log((out.stdout || "").split("\n").slice(-20).join("\n"));
-    await exec(conn, `cd ${supaDir} && (docker compose restart realtime || docker-compose restart realtime) 2>&1`);
-    await log("✓ Realtime réparé (publication + redémarrage)");
-    (globalThis as any).__lastDeployResult = { action: "repair_realtime", ok: true };
+    await exec(conn, `cd ${supaDir} && (docker compose restart realtime kong || docker-compose restart realtime kong) 2>&1`);
+
+    // Correctif LAN/same-origin : le client Realtime doit utiliser l'origine du navigateur
+    const repoDir = `${remoteDir}/repo`;
+    const repoPresent = (await exec(conn, `[ -d ${repoDir} ] && echo OK || echo NO`)).stdout.includes("OK");
+    if (repoPresent) {
+      await patchRemoteLanOriginFallback(conn, repoDir, log);
+      await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
+      await log("✓ Client runtime same-origin appliqué (Realtime LAN/WAN)");
+    } else {
+      await log(`⚠ Dépôt absent dans ${repoDir} : correctif same-origin non appliqué`);
+    }
+
+    // Vérification fonctionnelle du WebSocket Realtime via l'origine locale
+    const detectedLan = (await exec(conn, `hostname -I 2>/dev/null | tr ' ' '\n' | awk '/^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/ {print; exit}'`)).stdout.trim() || "127.0.0.1";
+    let wsOk = false;
+    let wsDetail = "";
+    for (let i = 0; i < 10; i++) {
+      const probe = await exec(
+        conn,
+        `curl -s -o /dev/null -w '%{http_code}' -m 8 -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' 'http://${detectedLan}/realtime/v1/websocket?apikey=test&vsn=1.0.0' || true`,
+      );
+      wsDetail = (probe.stdout || "").trim();
+      // 101 = upgrade accepté, 401/403 = service joignable mais clé de test rejetée
+      if (["101", "400", "401", "403"].includes(wsDetail)) { wsOk = true; break; }
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+    if (!wsOk) {
+      const logs = await exec(conn, `cd ${supaDir} && (docker compose logs --tail=40 realtime || docker-compose logs --tail=40 realtime) 2>&1`);
+      await log((logs.stdout || "").split("\n").slice(-40).join("\n"));
+      throw new Error(`Realtime injoignable via http://${detectedLan}/realtime/v1/websocket (code ${wsDetail || "aucun"})`);
+    }
+
+    await log(`✓ Realtime réparé (publication + redémarrage + WebSocket OK sur ${detectedLan}, code ${wsDetail})`);
+    (globalThis as any).__lastDeployResult = { action: "repair_realtime", ok: true, lan_ip: detectedLan, ws_code: wsDetail };
   } finally {
     try { conn.end(); } catch (_) {}
   }
+
 }
 
 

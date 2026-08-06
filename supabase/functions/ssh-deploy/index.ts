@@ -231,7 +231,8 @@ async function prepareEarlyWebDeployment(
       (await readRemoteEnv(conn, `${remoteDir}/supabase/.env`, "KONG_HTTP_PORT")) ||
       body.supabase_kong_http_port ||
       "8000";
-    await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(buildUploadRepairNginxConf(kongPort)));
+    const earlyKongUpstream = await detectKongUpstream(conn, remoteDir, kongPort, log);
+    await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(buildUploadRepairNginxConf(kongPort, earlyKongUpstream)));
     await log(`✓ nginx.conf absent du dépôt distant : recréé (Kong ${kongPort})`);
   }
 
@@ -2793,7 +2794,8 @@ async function repairLocalApiUrlOnExistingDeployment(conn: Client, body: DeployB
   await log(`→ IP LAN réelle retenue : ${localIp}`);
   await log(`→ Réparation URL API navigateur : ${publicBase}`);
 
-  const nginxConf = buildUploadRepairNginxConf(kongPort);
+  const kongUpstream = await detectKongUpstream(conn, remoteDir, kongPort, log);
+  const nginxConf = buildUploadRepairNginxConf(kongPort, kongUpstream);
 
   await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(nginxConf));
   await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
@@ -2978,7 +2980,8 @@ async function patchRunningWebProxyForUploads(conn: Client, body: DeployBody, ko
   const remoteDir = body.remote_dir || "/opt/screenflow";
   const repoDir = `${remoteDir}/repo`;
   const appPort = body.app_port || "8080";
-  const nginxConf = buildUploadRepairNginxConf(kongPort);
+  const kongUpstream = await detectKongUpstream(conn, remoteDir, kongPort, log);
+  const nginxConf = buildUploadRepairNginxConf(kongPort, kongUpstream);
   const tmpConf = `/tmp/screenflow-upload-fix-${crypto.randomUUID()}.conf`;
   const result: any = { patched: false, ok: false, skipped: false, detail: "" };
 
@@ -3879,7 +3882,7 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
       start_period: 10s
 `;
     await uploadFile(conn, `${repoDir}/docker-compose.yml`, Buffer.from(compose));
-    await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(buildUploadRepairNginxConf(kongPort)));
+    await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(buildUploadRepairNginxConf(kongPort, repairKongUpstream)));
     await log(`✓ Configuration web canonique recréée (conteneur screenflow-web, port ${appPort}, Kong ${kongPort}, backend ${localBackendPresent ? "same-origin" : "externe"})`);
     const composeConfig = await exec(conn, `cd ${repoDir} && (docker compose config --quiet || docker-compose config --quiet) 2>&1`);
     if (composeConfig.code !== 0) {
@@ -3965,7 +3968,7 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
       await log(result.host_gateway_ok
         ? `✓ host.docker.internal résolu (${(gw.stdout || "").trim().split(/\s+/)[0]})`
         : "✗ host.docker.internal non résolu dans le conteneur web — le proxy vers Kong/Storage ne peut pas fonctionner.");
-      const up = await exec(conn, `docker exec ${cid} sh -c 'wget -q -S -O /dev/null http://${kongPort}/storage/v1/bucket 2>&1 | head -3' || true`);
+      const up = await exec(conn, `docker exec ${cid} sh -c 'wget -q -S -O /dev/null http://${upstreamAuthority(repairKongUpstream)}/storage/v1/bucket 2>&1 | head -3' || true`);
       if ((up.stdout || "").trim()) await log("ℹ Test Storage depuis le conteneur web : " + (up.stdout || "").trim().replace(/\s+/g, " ").slice(0, 200));
     }
 
@@ -4460,8 +4463,8 @@ async function runNetworkInspect(body: DeployBody, log: (m: string) => Promise<v
     const webName = (await exec(conn, `cd ${remoteDir}/repo && (docker compose ps -q web || docker-compose ps -q web) 2>/dev/null | head -1`)).stdout.trim();
     const tests: any[] = [];
     if (webName) {
-      const gatewayProbe = await exec(conn, `docker exec ${webName} sh -lc ${shQuote(`wget -q -T 5 -S -O /dev/null --header=${shQuote(`apikey: ${anonKey}`)} http://${kongPort}/rest/v1/ 2>&1`)} 2>&1`);
-      tests.push({ from: "web", to: `host.docker.internal:${kongPort}/rest/v1`, ok: gatewayProbe.code === 0, output: `${gatewayProbe.stdout}${gatewayProbe.stderr}`.trim().slice(-300) });
+      const gatewayProbe = await exec(conn, `docker exec ${webName} sh -lc ${shQuote(`wget -q -T 5 -S -O /dev/null --header=${shQuote(`apikey: ${anonKey}`)} http://${upstreamAuthority(inspectKongUpstream)}/rest/v1/ 2>&1`)} 2>&1`);
+      tests.push({ from: "web", to: `${upstreamAuthority(inspectKongUpstream)}/rest/v1`, ok: gatewayProbe.code === 0, output: `${gatewayProbe.stdout}${gatewayProbe.stderr}`.trim().slice(-300) });
       const appPort = body.app_port || "8080";
       const proxyProbe = await exec(conn, `curl -sS -m 5 -o /dev/null -w "%{http_code}" http://127.0.0.1:${appPort}/rest/v1/ -H ${shQuote(`apikey: ${anonKey}`)} -H ${shQuote(`Authorization: Bearer ${anonKey}`)} 2>/dev/null || true`);
       const proxyCode = (proxyProbe.stdout || "").trim();

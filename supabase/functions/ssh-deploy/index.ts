@@ -3113,13 +3113,15 @@ async function repairUploadsNowCore(conn: Client, body: DeployBody, log: (m: str
   }
 
   const proxy = await patchRunningWebProxyForUploads(conn, body, kongPort, anonKey, supaDir, log);
+  const originFix = await applyBrowserOriginBackendFix(conn, body, remoteDir, log);
   const url = resolveBrowserAppBase(body, body.app_port || "8080");
   const ok = storageTests.every((test) => test.ok) && (proxy.ok || proxy.skipped);
-  const result = { action: "repair_uploads_now", ok, url, storage_service: storageService, storage_tests: storageTests, proxy, supabase_local: { url, anon_key: anonKey } };
+  const result = { action: "repair_uploads_now", ok, url, storage_service: storageService, storage_tests: storageTests, proxy, origin_fix: originFix, supabase_local: { url, anon_key: anonKey } };
 
   await log(ok
-    ? "✓ Uploads bibliothèque + QR corrigés. Rechargez l'application locale puis retestez."
+    ? "✓ Uploads bibliothèque + QR corrigés (LAN et WAN sur l'origine du navigateur). Rechargez l'application puis retestez."
     : "⚠ Réparation appliquée mais un test d'upload échoue encore — copiez le journal ci-dessus pour identifier le blocage exact.");
+
   return result;
 }
 

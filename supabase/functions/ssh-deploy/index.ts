@@ -200,6 +200,11 @@ async function prepareEarlyWebDeployment(
   const isLocalBackend = projectId === "local";
   const browserSupabaseUrl = isLocalBackend ? "__SCREENFLOW_SAME_ORIGIN__" : supabaseUrl;
   const quoteYaml = (value: string) => `'${(value || "").replace(/'/g, "''")}'`;
+  const kongPort =
+    (await readRemoteEnv(conn, `${remoteDir}/supabase/.env`, "KONG_HTTP_PORT")) ||
+    body.supabase_kong_http_port ||
+    "8000";
+  const earlyKongUpstream = await detectKongUpstream(conn, remoteDir, kongPort, log);
   const compose = `services:
   web:
     container_name: screenflow-web
@@ -213,28 +218,25 @@ async function prepareEarlyWebDeployment(
         VITE_APP_BASE_PATH: '/'
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    ports:
+${composeServiceNetworks(earlyKongUpstream)}    ports:
       - "${appPort}:80"
     restart: unless-stopped
-`;
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+${composeTopLevelNetworks(earlyKongUpstream)}`;
   await uploadFile(conn, `${repoDir}/docker-compose.yml`, Buffer.from(compose));
   await patchRemoteBuildEntrypoint(conn, repoDir, log);
   await patchRemoteLanOriginFallback(conn, repoDir, log);
   await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
 
-  // A remote branch (or a shallow/partial clone) may not ship nginx.conf.
-  // Recreate a canonical proxy config instead of aborting the deployment:
-  // the definitive one is rewritten later with the resolved Kong port.
-  const hasNginx = await exec(conn, `[ -f ${repoDir}/nginx.conf ] && echo OK || echo NO`);
-  if (!(hasNginx.stdout || "").includes("OK")) {
-    const kongPort =
-      (await readRemoteEnv(conn, `${remoteDir}/supabase/.env`, "KONG_HTTP_PORT")) ||
-      body.supabase_kong_http_port ||
-      "8000";
-    const earlyKongUpstream = await detectKongUpstream(conn, remoteDir, kongPort, log);
-    await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(buildUploadRepairNginxConf(kongPort, earlyKongUpstream)));
-    await log(`✓ nginx.conf absent du dépôt distant : recréé (Kong ${kongPort})`);
-  }
+  // Never trust an older repository nginx.conf here: a fresh installation must
+  // already contain the same Auth/REST/Storage/Realtime proxy as the repair path.
+  await uploadFile(conn, `${repoDir}/nginx.conf`, Buffer.from(buildUploadRepairNginxConf(kongPort, earlyKongUpstream)));
+  await log(`✓ Proxy web canonique préparé dès l'installation (${earlyKongUpstream.via})`);
 
   const required = await exec(conn, `[ -f ${repoDir}/Dockerfile ] && [ -f ${repoDir}/nginx.conf ] && echo OK || echo NO`);
   if (!(required.stdout || "").includes("OK")) {
@@ -2392,7 +2394,7 @@ ENV VITE_SUPABASE_PUBLISHABLE_KEY=$VITE_SUPABASE_PUBLISHABLE_KEY
 ENV VITE_SUPABASE_PROJECT_ID=$VITE_SUPABASE_PROJECT_ID
 ENV VITE_PUBLIC_APP_URL=$VITE_PUBLIC_APP_URL
 ENV VITE_APP_BASE_PATH=$VITE_APP_BASE_PATH
-RUN npm run build
+RUN npm run build -- --mode selfhosted
 FROM nginx:alpine
 COPY --from=builder /app/dist /usr/share/nginx/html
 COPY nginx.conf /etc/nginx/conf.d/default.conf
@@ -2515,6 +2517,12 @@ ${localFunctionLocations}
       - "host.docker.internal:host-gateway"
 ${composeServiceNetworks(kongUpstream)}${portsBlock}
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
 ${composeTopLevelNetworks(kongUpstream)}`;
 
       await uploadFile(conn, `${remoteDir}/repo/Dockerfile`, Buffer.from(dockerfile));
@@ -2639,6 +2647,18 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
       );
     }
 
+    const freshWebCid = (await exec(conn, `cd ${remoteDir}/repo && (docker compose ps -q web || docker-compose ps -q web) 2>/dev/null | head -1`)).stdout.trim();
+    if (!freshWebCid) throw new Error("Le conteneur web est introuvable après le premier build.");
+    const freshBundleCheck = await exec(conn, `docker exec ${freshWebCid} sh -c 'if grep -R -q "const [A-Za-z0-9_$]*=\"__SCREENFLOW_SAME_ORIGIN__\".*createClient\|YTe(\"__SCREENFLOW_SAME_ORIGIN__\"" /usr/share/nginx/html/assets 2>/dev/null; then echo INVALID_MARKER; else echo OK; fi'`);
+    connectivity.browser_bundle = {
+      ok: (freshBundleCheck.stdout || "").includes("OK"),
+      detail: (freshBundleCheck.stdout || freshBundleCheck.stderr || "contrôle impossible").trim(),
+    };
+    await log(`  • Bundle client : ${connectivity.browser_bundle.ok ? "✓" : "✗"} ${connectivity.browser_bundle.detail}`);
+    if (!connectivity.browser_bundle.ok) {
+      throw new Error("Le bundle du premier déploiement contient une URL backend invalide et produirait une page blanche.");
+    }
+
     // A loopback success does not prove that the host firewall/provider allows
     // remote traffic. Probe the exact browser URL from outside the SSH server.
     try {
@@ -2676,6 +2696,19 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
       await log(`  • Supabase Auth    : ${connectivity.auth.ok ? "✓" : "✗"} ${connectivity.auth.detail}`);
       await log(`  • Supabase Storage : ${connectivity.storage.ok ? "✓" : "✗"} ${connectivity.storage.detail}`);
       await log(`  • Postgres         : ${connectivity.postgres.ok ? "✓" : "✗"} ${connectivity.postgres.detail}`);
+
+      const initialUploadTests = [
+        await verifyStorageUploadAtBase(conn, `${remoteDir}/supabase`, `http://127.0.0.1:${supaKongPort}`, supabaseAnonOverride, "uploads", "initial_deploy"),
+        await verifyStorageUploadAtBase(conn, `${remoteDir}/supabase`, `http://127.0.0.1:${supaKongPort}`, supabaseAnonOverride, "media", "initial_deploy"),
+      ];
+      connectivity.storage_writes = {
+        ok: initialUploadTests.every((test) => test.ok),
+        detail: initialUploadTests.map((test) => `${test.bucket}=HTTP ${test.status}${test.detail ? ` (${test.detail})` : ""}`).join(", "),
+      };
+      await log(`  • Écriture médias  : ${connectivity.storage_writes.ok ? "✓" : "✗"} ${connectivity.storage_writes.detail}`);
+      if (!connectivity.storage_writes.ok) {
+        throw new Error(`Le backend répond mais l'écriture réelle dans les buckets média échoue (${connectivity.storage_writes.detail}).`);
+      }
 
       // A healthy Kong is not enough: browsers only use the web container's
       // same-origin proxy. Validate that exact route before declaring success.

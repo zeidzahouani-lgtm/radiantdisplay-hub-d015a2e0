@@ -1715,7 +1715,6 @@ async function runDeploymentJob(
   try {
     await persist({ status: "running", logs: [] });
     let directResult: any = null;
-    (globalThis as any).__lastDeployResult = null;
     if (body.action === "reset_admin_password") {
       await runResetAdminPassword(body, log);
     } else if (body.action === "check_admin_status") {
@@ -1757,7 +1756,7 @@ async function runDeploymentJob(
     } else if (body.action === "network_set_container_ip") {
       directResult = await runNetworkSetContainerIp(body, log);
     } else {
-      await runDeployment(body, log);
+      directResult = await runDeployment(body, log);
     }
     const result = directResult ?? (globalThis as any).__lastDeployResult ?? null;
     const resultFailed = !!result && typeof result === "object" && "ok" in result && result.ok === false;
@@ -1949,6 +1948,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
   let supabaseUrlOverride = "";
   let supabaseAnonOverride = "";
   let supabaseProjectIdOverride = "";
+  let postgresOnlyResult: { image: string; port: string; password: string; host: string } | null = null;
   let earlyWebStarted = false;
   // L'edge function est coupée par le runtime après ~400s : on sort proprement avant.
   const deploymentDeadline = Date.now() + 8 * 60 * 1000;
@@ -2286,7 +2286,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
         await log(`  • Image:      ${postgresImage}`);
         await log(`  • Connexion locale serveur: postgres://postgres:${postgresPw}@127.0.0.1:${supaDbPort}/postgres`);
         await log(`  • Mot de passe: ${postgresPw}  (notez-le, il ne sera pas réaffiché)`);
-        (globalThis as any).__pgOnlyResult = { image: postgresImage, port: supaDbPort, password: postgresPw, host: body.host };
+        postgresOnlyResult = { image: postgresImage, port: supaDbPort, password: postgresPw, host: body.host };
       }
 
       if (installSupabase && isExistingSupabase) {
@@ -2797,8 +2797,7 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
     const url = appUrl;
     await log(`🚀 Deployment complete — accessible at ${url}`);
 
-    const pgOnly = (globalThis as any).__pgOnlyResult || null;
-    (globalThis as any).__lastDeployResult = {
+    return {
       url,
       db_stack: dbStack,
       postgres_image: (installSupabase || installPostgresOnly) ? postgresImage : null,
@@ -2808,7 +2807,7 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
         anon_key: supabaseAnonOverride,
         studio_url: `http://${localIp}:${supaStudioPort}`,
       } : null,
-      postgres_only: pgOnly,
+      postgres_only: postgresOnlyResult,
     };
   } catch (innerErr: any) {
     try { conn.end(); } catch (_) {}

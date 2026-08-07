@@ -3177,11 +3177,12 @@ async function applyBrowserOriginBackendFix(
   await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
 
   // Invariants du correctif WAN : self-hosted ⇒ origine navigateur pour l'API
-  // et pour les URLs générées (QR, liens player).
+  // et pour les URLs générées (QR, liens player). The explicit project-id
+  // guard is essential when NAT keeps the same hostname but translates ports.
   const check = await exec(
     conn,
     `f=${repoDir}/src/lib/env.ts; ` +
-      `if [ -f "$f" ] && grep -Fq 'isManagedSupabaseHost' "$f" && grep -Fq 'isLovablePreview' "$f"; then echo INVARIANTS_OK; else echo INVARIANTS_MISSING; fi`,
+      `if [ -f "$f" ] && grep -Fq 'appEnv.supabaseProjectId === "local"' "$f" && grep -Fq 'isManagedSupabaseHost' "$f" && grep -Fq 'isLovablePreview' "$f"; then echo INVARIANTS_OK; else echo INVARIANTS_MISSING; fi`,
   );
   info.invariants_ok = (check.stdout || "").includes("INVARIANTS_OK");
   await log(

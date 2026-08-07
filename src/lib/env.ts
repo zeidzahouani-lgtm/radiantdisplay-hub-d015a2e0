@@ -76,6 +76,13 @@ function shouldUseRuntimeOrigin(configuredUrl: string) {
   if (isSameOriginSupabaseMarker(configuredUrl)) return true;
   const runtimeOrigin = getRuntimeOrigin();
   if (!runtimeOrigin) return false;
+  // A self-hosted build always exposes Auth/REST/Storage/Realtime through the
+  // web app's same-origin Nginx proxy. Comparing hostnames is insufficient:
+  // with NAT, the configured URL may contain the internal port while the WAN
+  // browser reaches the same host on port 80/443. In that case direct XHR
+  // uploads were sent to the unreachable internal port. Keep the complete
+  // browser origin (scheme + host + effective port) for LAN, WAN and localhost.
+  if (appEnv.supabaseProjectId === "local") return true;
   const runtimeHost = hostnameFromUrl(runtimeOrigin);
   const configuredHost = hostnameFromUrl(configuredUrl);
   if (!runtimeHost || runtimeHost === configuredHost) return false;

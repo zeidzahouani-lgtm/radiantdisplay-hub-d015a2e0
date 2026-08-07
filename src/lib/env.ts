@@ -18,12 +18,12 @@ function clean(value?: string) {
 }
 
 export const appEnv = {
-  supabaseUrl: clean(rawEnv.VITE_SUPABASE_URL),
-  supabasePublishableKey: clean(rawEnv.VITE_SUPABASE_PUBLISHABLE_KEY),
-  supabaseProjectId: clean(rawEnv.VITE_SUPABASE_PROJECT_ID),
-  databaseUrl: clean(rawEnv.DATABASE_URL),
-  publicAppUrl: clean(rawEnv.VITE_PUBLIC_APP_URL),
-  appBasePath: clean(rawEnv.VITE_APP_BASE_PATH) || "/",
+  supabaseUrl: clean(import.meta.env.VITE_SUPABASE_URL),
+  supabasePublishableKey: clean(import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY),
+  supabaseProjectId: clean(import.meta.env.VITE_SUPABASE_PROJECT_ID),
+  databaseUrl: clean(import.meta.env.DATABASE_URL),
+  publicAppUrl: clean(import.meta.env.VITE_PUBLIC_APP_URL),
+  appBasePath: clean(import.meta.env.VITE_APP_BASE_PATH) || "/",
 };
 
 function getRuntimeOrigin() {
@@ -92,13 +92,13 @@ function shouldUseRuntimeOrigin(configuredUrl: string) {
 export function getSupabaseUrl() {
   const configured = appEnv.supabaseUrl;
   if (shouldUseRuntimeOrigin(configured)) {
-    return getRuntimeOrigin();
+    return getRuntimeOrigin() || "http://localhost:8000";
   }
-  return normalizeUrl(configured);
+  return normalizeUrl(configured) || getRuntimeOrigin() || "http://localhost:8000";
 }
 
 export function getSupabasePublishableKey() {
-  return appEnv.supabasePublishableKey;
+  return appEnv.supabasePublishableKey || "missing-publishable-key-please-check-env";
 }
 
 export function supabaseEndpoint(path: string) {
@@ -246,7 +246,7 @@ export function explainSupabaseError(error: unknown, context = "Supabase") {
       Object.keys(localStorage).forEach((k) => {
         if (k.startsWith("sb-") || k.includes("supabase.auth")) localStorage.removeItem(k);
       });
-      setTimeout(() => { window.location.href = "/login"; }, 1500);
+      setTimeout(() => { window.location.href = buildAppUrl("/login"); }, 1500);
     } catch {}
   }
 

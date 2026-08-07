@@ -2655,21 +2655,35 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
 
     const freshWebCid = (await exec(conn, `cd ${remoteDir}/repo && (docker compose ps -q web || docker-compose ps -q web) 2>/dev/null | head -1`)).stdout.trim();
     if (!freshWebCid) throw new Error("Le conteneur web est introuvable après le premier build.");
+    // Code splitting can move the runtime client into a secondary chunk, so the
+    // marker must be searched across ALL emitted assets, not only the entry file.
     const freshBundleCheck = await exec(
       conn,
-      `docker exec ${freshWebCid} sh -c 'set -e; test -s /usr/share/nginx/html/index.html; ` +
-        `asset=$(grep -oE "src=\"[^\"]+\\.js([^\"]*)?\"" /usr/share/nginx/html/index.html | head -1 | cut -d\" -f2); ` +
-        `test -n "$asset"; asset="/usr/share/nginx/html${'$'}{asset%%\?*}"; test -s "$asset"; ` +
-        `grep -q "screenflow-local-auth-v3" "$asset"; echo OK'`,
+      `docker exec ${freshWebCid} sh -c 'set -e; ` +
+        `test -s /usr/share/nginx/html/index.html || { echo MISSING_INDEX; exit 1; }; ` +
+        `count=$(ls /usr/share/nginx/html/assets/*.js 2>/dev/null | wc -l); ` +
+        `[ "$count" -gt 0 ] || { echo MISSING_ASSETS; exit 1; }; ` +
+        `if grep -R -l "__SCREENFLOW_SAME_ORIGIN__" /usr/share/nginx/html/assets >/dev/null 2>&1; then echo INVALID_MARKER; exit 1; fi; ` +
+        `grep -R -q "screenflow-local-auth-v3" /usr/share/nginx/html/assets 2>/dev/null || { echo RUNTIME_CLIENT_MISSING; exit 1; }; ` +
+        `echo OK'`,
     );
+    const freshBundleOutput = `${freshBundleCheck.stdout || ""}${freshBundleCheck.stderr || ""}`.trim();
     connectivity.browser_bundle = {
-      ok: (freshBundleCheck.stdout || "").includes("OK"),
-      detail: (freshBundleCheck.stdout || freshBundleCheck.stderr || "contrôle impossible").trim(),
+      ok: freshBundleOutput.includes("OK") && !freshBundleOutput.includes("INVALID_MARKER"),
+      detail: freshBundleOutput.slice(-400) || "contrôle impossible",
     };
     await log(`  • Bundle client : ${connectivity.browser_bundle.ok ? "✓" : "✗"} ${connectivity.browser_bundle.detail}`);
     if (!connectivity.browser_bundle.ok) {
-      throw new Error("Le bundle du premier déploiement contient une URL backend invalide et produirait une page blanche.");
+      const reason = freshBundleOutput.includes("INVALID_MARKER")
+        ? "le marqueur same-origin est transmis tel quel au client backend"
+        : freshBundleOutput.includes("MISSING_ASSETS") || freshBundleOutput.includes("MISSING_INDEX")
+          ? "les fichiers statiques du build sont absents du conteneur"
+          : freshBundleOutput.includes("RUNTIME_CLIENT_MISSING")
+            ? "le client backend runtime (alias same-origin) n'est pas inclus dans le build"
+            : `contrôle non concluant (${freshBundleOutput || "sortie vide"})`;
+      throw new Error(`Le bundle du premier déploiement est invalide : ${reason}.`);
     }
+
 
     // A loopback success does not prove that the host firewall/provider allows
     // remote traffic. Probe the exact browser URL from outside the SSH server.

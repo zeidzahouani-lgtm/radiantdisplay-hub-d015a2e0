@@ -2439,7 +2439,7 @@ CMD ["nginx","-g","daemon off;"]
       // CRITICAL: client_max_body_size must be large enough for media uploads (videos can be hundreds of MB).
       // proxy_request_buffering off allows streaming large uploads to Kong/Storage without buffering to disk first.
       const commonProxyHeaders = (_proto: string) => `${corsHidesAndAdds} proxy_set_header Host $http_host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $http_host;`;
-      const storageProxy = (proto: string) => `proxy_pass http://${kongTarget}/storage/v1/; ${commonProxyHeaders(proto)} client_max_body_size 1024m; proxy_request_buffering off; proxy_buffering off; proxy_read_timeout 3600s; proxy_send_timeout 3600s;`;
+      const storageProxy = (proto: string) => `proxy_pass http://${kongTarget}/storage/v1/; ${commonProxyHeaders(proto)} client_max_body_size 1024m; client_body_timeout 3600s; proxy_request_buffering off; proxy_buffering off; proxy_read_timeout 3600s; proxy_send_timeout 3600s;`;
       const restProxy = (proto: string) => `proxy_pass http://${kongTarget}/rest/v1/; ${commonProxyHeaders(proto)} client_max_body_size 50m;`;
       const authProxy = (proto: string) => `proxy_pass http://${kongTarget}/auth/v1/; ${commonProxyHeaders(proto)} client_max_body_size 10m;`;
       const realtimeProxy = (proto: string) => `proxy_pass http://${kongTarget}/realtime/v1/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; ${commonProxyHeaders(proto)} proxy_read_timeout 3600s; proxy_send_timeout 3600s;`;
@@ -2460,6 +2460,9 @@ server {
   ssl_certificate_key /etc/nginx/ssl/server.key;
   ssl_protocols TLSv1.2 TLSv1.3;
   client_max_body_size 1024m;
+  client_body_timeout 3600s;
+  client_header_timeout 300s;
+  send_timeout 3600s;
   root /usr/share/nginx/html;
   index index.html;
 ${preflightLocation}
@@ -2478,6 +2481,9 @@ server {
   listen 80;
   server_name _;
   client_max_body_size 1024m;
+  client_body_timeout 3600s;
+  client_header_timeout 300s;
+  send_timeout 3600s;
   root /usr/share/nginx/html;
   index index.html;
 ${preflightLocation}
@@ -2991,6 +2997,9 @@ server {
   proxy_connect_timeout 10s;
   proxy_send_timeout 3600s;
   proxy_read_timeout 3600s;
+  client_body_timeout 3600s;
+  client_header_timeout 300s;
+  send_timeout 3600s;
   set $cors_origin $http_origin;
   error_page 418 = @cors_preflight;
   location @cors_preflight {
@@ -3004,7 +3013,7 @@ server {
   }
   location /auth/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://${kongPort}/auth/v1/; proxy_set_header Host $http_host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $http_host; }
   location /rest/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://${kongPort}/rest/v1/; proxy_set_header Host $http_host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $http_host; client_max_body_size 50m; }
-  location /storage/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://${kongPort}/storage/v1/; proxy_set_header Host $http_host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $http_host; client_max_body_size 1024m; proxy_request_buffering off; proxy_buffering off; proxy_read_timeout 3600s; proxy_send_timeout 3600s; }
+  location /storage/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://${kongPort}/storage/v1/; proxy_set_header Host $http_host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Upsert $http_x_upsert;  proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $http_host; client_max_body_size 1024m; client_body_timeout 3600s; proxy_request_buffering off; proxy_buffering off; proxy_read_timeout 3600s; proxy_send_timeout 3600s; }
   location /functions/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://${kongPort}/functions/v1/; proxy_set_header Host $http_host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $http_host; }
   location /realtime/v1/ { proxy_hide_header Access-Control-Allow-Origin; proxy_hide_header Access-Control-Allow-Methods; proxy_hide_header Access-Control-Allow-Headers; proxy_hide_header Access-Control-Expose-Headers; if ($request_method = OPTIONS) { return 418; } add_header Access-Control-Allow-Origin $cors_origin always; add_header Vary Origin always; add_header Access-Control-Expose-Headers "content-range, x-supabase-api-version, x-request-id, location" always; proxy_pass http://${kongPort}/realtime/v1/; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host $http_host; proxy_set_header Authorization $http_authorization; proxy_set_header apikey $http_apikey; proxy_set_header X-Client-Info $http_x_client_info; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Host $http_host; proxy_read_timeout 3600s; proxy_send_timeout 3600s; }
   location /assets/ { expires 1y; add_header Cache-Control "public, immutable"; }

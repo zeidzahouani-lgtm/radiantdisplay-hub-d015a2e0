@@ -113,8 +113,8 @@ export function supabaseEndpoint(path: string) {
  */
 export function getAppBasePath() {
   const raw = appEnv.appBasePath || "/";
-  if (raw === "/") return "/";
-  return ("/" + raw.replace(/^\/+|\/+$/g, "")) || "/";
+  if (raw === "/") return "";
+  return ("/" + raw.replace(/^\/+|\/+$/g, "")) || "";
 }
 
 /**

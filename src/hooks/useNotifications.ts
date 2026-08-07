@@ -28,10 +28,13 @@ export function useNotifications() {
     },
   });
 
-  // Realtime subscription
+  // Realtime subscription (unique channel per hook instance)
   useEffect(() => {
-    const channel = supabase
-      .channel("notifications-realtime")
+    const channel = supabase.channel(
+      `notifications-realtime-${Math.random().toString(36).slice(2)}`
+    );
+
+    channel
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "notifications" }, () => {
         queryClient.invalidateQueries({ queryKey: ["notifications"] });
       })

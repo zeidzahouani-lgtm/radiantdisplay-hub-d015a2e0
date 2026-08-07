@@ -67,6 +67,10 @@ const NGINX_CONF = `server {
   server_name _;
   root /usr/share/nginx/html;
   index index.html;
+  client_max_body_size 1024m;
+  client_body_timeout 3600s;
+  client_header_timeout 300s;
+  send_timeout 3600s;
 
   # SPA fallback
   location / {

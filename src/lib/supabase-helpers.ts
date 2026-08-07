@@ -1,5 +1,5 @@
 import { supabase } from "@/integrations/supabase/client";
-import { getSupabasePublishableKey, supabaseEndpoint } from "@/lib/env";
+import { appEnv, getSupabasePublishableKey, supabaseEndpoint } from "@/lib/env";
 
 function safeUUID(): string {
   try {
@@ -40,6 +40,34 @@ function parseStorageError(responseText: string): { message: string; code: strin
 
 type UploadResult = { ok: boolean; status: number; message: string; code: string; raw: string };
 
+function storageEndpoint(path: string): string {
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+
+  // A self-hosted installation exposes Storage through the same web proxy as
+  // the application. A relative URL is deliberately used here: the browser
+  // retains the exact public scheme, hostname and port selected by the user,
+  // including when a router translates a WAN port to a different LAN port.
+  // This also avoids depending on a stale VITE_SUPABASE_URL in an older image.
+  if (appEnv.supabaseProjectId === "local" && typeof window !== "undefined") {
+    return normalizedPath;
+  }
+
+  return supabaseEndpoint(normalizedPath);
+}
+
+function publicStorageUrl(bucket: string, fileName: string): string {
+  const path = `/storage/v1/object/public/${encodeURIComponent(bucket)}/${fileName
+    .split("/")
+    .map(encodeURIComponent)
+    .join("/")}`;
+
+  if (appEnv.supabaseProjectId === "local" && typeof window !== "undefined") {
+    return new URL(path, window.location.origin).toString();
+  }
+
+  return supabaseEndpoint(path);
+}
+
 async function putObject(
   bucket: string,
   fileName: string,
@@ -48,7 +76,8 @@ async function putObject(
   sendContentType: boolean,
   onProgress?: (percent: number) => void
 ): Promise<UploadResult> {
-  const url = supabaseEndpoint(`/storage/v1/object/${bucket}/${fileName}`);
+  const objectPath = fileName.split("/").map(encodeURIComponent).join("/");
+  const url = storageEndpoint(`/storage/v1/object/${encodeURIComponent(bucket)}/${objectPath}`);
   const apiKey = getSupabasePublishableKey();
   const { data: sessionData } = await supabase.auth.getSession();
   const accessToken = sessionData?.session?.access_token || apiKey;
@@ -75,8 +104,13 @@ async function putObject(
       resolve({ ok: false, status: xhr.status, message: parsed.message, code: parsed.code, raw: xhr.responseText || "" });
     };
     xhr.onerror = () => {
-      console.error("[upload-media] Network/CORS error", { url });
-      resolve({ ok: false, status: 0, message: `Erreur réseau/CORS vers ${url}.`, code: "network", raw: "" });
+      const resolvedUrl = typeof window !== "undefined" ? new URL(url, window.location.href).toString() : url;
+      console.error("[upload-media] Network/proxy error", {
+        url: resolvedUrl,
+        origin: typeof window !== "undefined" ? window.location.origin : "",
+        online: typeof navigator !== "undefined" ? navigator.onLine : undefined,
+      });
+      resolve({ ok: false, status: 0, message: `Connexion interrompue vers ${resolvedUrl}.`, code: "network", raw: "" });
     };
 
     xhr.send(file);
@@ -109,8 +143,7 @@ export async function uploadMediaFile(
       const fallback = bucket === "media" ? "uploads" : "media";
       const alt = await putObject(fallback, fileName, file, true, true, onProgress);
       if (alt.ok) {
-        const { data } = supabase.storage.from(fallback).getPublicUrl(fileName);
-        return data.publicUrl;
+        return publicStorageUrl(fallback, fileName);
       }
     }
     // Invalid key → sanitize aggressively
@@ -136,8 +169,7 @@ export async function uploadMediaFile(
     throw new Error(`Upload échoué (HTTP ${res.status}) — ${detail}`);
   }
 
-  const { data } = supabase.storage.from(bucket).getPublicUrl(fileName);
-  return data.publicUrl;
+  return publicStorageUrl(bucket, fileName);
 }
 
 

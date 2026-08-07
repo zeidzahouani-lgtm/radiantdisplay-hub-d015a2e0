@@ -28,8 +28,18 @@ docker build \
   -t "$IMAGE_NAME" .
 
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+KONG_NETWORK="${KONG_NETWORK:-$(docker inspect -f '{{range $name, $config := .NetworkSettings.Networks}}{{$name}} {{end}}' "$(docker ps --format '{{.ID}} {{.Names}}' | awk 'tolower($0) ~ /kong/ {print $1; exit}')" 2>/dev/null | awk '{print $1}')}"
+NETWORK_ARGS=()
+if [ -n "$KONG_NETWORK" ] && [ "$KONG_NETWORK" != "bridge" ] && [ "$KONG_NETWORK" != "host" ]; then
+  NETWORK_ARGS=(--network "$KONG_NETWORK")
+  echo "Proxy backend via le réseau Docker $KONG_NETWORK (kong:8000)"
+else
+  echo "Erreur: réseau Docker de Kong introuvable. Démarrez le backend local avant l'application." >&2
+  exit 1
+fi
 docker run -d --name "$CONTAINER_NAME" --restart unless-stopped \
   --add-host host.docker.internal:host-gateway \
+  "${NETWORK_ARGS[@]}" \
   -p "$BIND_HOST:$APP_PORT:80" "$IMAGE_NAME"
 
 echo "Déploiement local terminé: ${PUBLIC_APP_URL}"

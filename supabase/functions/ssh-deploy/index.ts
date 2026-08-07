@@ -3279,8 +3279,11 @@ async function repairUploadsNowCore(conn: Client, body: DeployBody, log: (m: str
     await log(`${test.ok ? "✓" : "✗"} Test ${test.label}/${test.bucket} → HTTP ${test.status}${test.detail ? ` (${test.detail})` : ""}`);
   }
 
-  const proxy = await patchRunningWebProxyForUploads(conn, body, kongPort, anonKey, supaDir, log);
+  // Synchronize/rebuild first. Previously this ran after the hot Nginx repair:
+  // git reset + Docker rebuild then restored the repository's stale proxy and
+  // silently cancelled the repair that had just succeeded.
   const originFix = await applyBrowserOriginBackendFix(conn, body, remoteDir, log);
+  const proxy = await patchRunningWebProxyForUploads(conn, body, kongPort, anonKey, supaDir, log);
   const url = resolveBrowserAppBase(body, body.app_port || "8080");
   const ok = storageTests.every((test) => test.ok) && (proxy.ok || proxy.skipped);
   const result = { action: "repair_uploads_now", ok, url, storage_service: storageService, storage_tests: storageTests, proxy, origin_fix: originFix, supabase_local: { url, anon_key: anonKey } };

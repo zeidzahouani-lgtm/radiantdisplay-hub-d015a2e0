@@ -3176,6 +3176,20 @@ async function applyBrowserOriginBackendFix(
   await patchRemoteLanOriginFallback(conn, repoDir, log);
   await patchRemoteRuntimeSupabaseClient(conn, repoDir, log);
 
+  // Uploads must use a relative /storage/v1 URL. This is stronger than merely
+  // resolving window.location.origin: no build-time host or translated NAT port
+  // can leak into the XHR request, even when an old environment is reused.
+  const uploadHelperCheck = await exec(
+    conn,
+    `f=${repoDir}/src/lib/supabase-helpers.ts; if [ -f "$f" ] && grep -Fq 'function storageEndpoint' "$f" && grep -Fq 'return normalizedPath' "$f"; then echo UPLOAD_RELATIVE_OK; else echo UPLOAD_RELATIVE_MISSING; fi`,
+  );
+  const relativeUploadOk = (uploadHelperCheck.stdout || "").includes("UPLOAD_RELATIVE_OK");
+  await log(
+    relativeUploadOk
+      ? "✓ Upload Storage strictement same-origin (/storage/v1) : compatible port NAT WAN/LAN"
+      : "⚠ Helper upload distant obsolète : vérifiez que le dépôt/branche configuré contient le correctif WAN",
+  );
+
   // Invariants du correctif WAN : self-hosted ⇒ origine navigateur pour l'API
   // et pour les URLs générées (QR, liens player). The explicit project-id
   // guard is essential when NAT keeps the same hostname but translates ports.
@@ -3184,7 +3198,7 @@ async function applyBrowserOriginBackendFix(
     `f=${repoDir}/src/lib/env.ts; ` +
       `if [ -f "$f" ] && grep -Fq 'appEnv.supabaseProjectId === "local"' "$f" && grep -Fq 'isManagedSupabaseHost' "$f" && grep -Fq 'isLovablePreview' "$f"; then echo INVARIANTS_OK; else echo INVARIANTS_MISSING; fi`,
   );
-  info.invariants_ok = (check.stdout || "").includes("INVARIANTS_OK");
+  info.invariants_ok = (check.stdout || "").includes("INVARIANTS_OK") && relativeUploadOk;
   await log(
     info.invariants_ok
       ? "✓ Origine navigateur active pour Storage/REST/Auth et pour les liens générés (LAN, IP publique, DNS dynamique)"

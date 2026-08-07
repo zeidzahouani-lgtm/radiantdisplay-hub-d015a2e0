@@ -194,11 +194,11 @@ async function prepareEarlyWebDeployment(
   log: (m: string) => Promise<void> | void,
 ) {
   const publicAppUrl = resolveBrowserAppBase(body, appPort, false);
-  // A local backend must always be reached through the web container proxy.
-  // The concrete browser origin is intentionally resolved at runtime, so the
-  // same image works through localhost, a LAN IP, a hostname and the WAN URL.
+  // Give Vite a syntactically valid absolute URL. The runtime client ignores
+  // this build-time URL for a local project and resolves window.location.origin,
+  // so the same image still works through LAN, WAN, hostname and localhost.
   const isLocalBackend = projectId === "local";
-  const browserSupabaseUrl = isLocalBackend ? "__SCREENFLOW_SAME_ORIGIN__" : supabaseUrl;
+  const browserSupabaseUrl = isLocalBackend ? publicAppUrl : supabaseUrl;
   const quoteYaml = (value: string) => `'${(value || "").replace(/'/g, "''")}'`;
   const kongPort =
     (await readRemoteEnv(conn, `${remoteDir}/supabase/.env`, "KONG_HTTP_PORT")) ||
@@ -441,10 +441,9 @@ function runtimeOrigin() {
 
 function resolveSupabaseUrl() {
   const origin = runtimeOrigin();
-  const marker = configuredUrl === '__SCREENFLOW_SAME_ORIGIN__' || configuredUrl === 'same-origin' || configuredUrl === 'runtime:same-origin';
   // Self-hosted builds are deliberately origin-agnostic. This removes every
   // dependency on the configured WAN address, NAT loopback and LAN detection.
-  if (origin && (projectId === 'local' || marker)) return origin;
+  if (origin && projectId === 'local') return origin;
   return configuredUrl;
 }
 
@@ -2503,7 +2502,7 @@ ${localFunctionLocations}
       const publicAppUrl = resolveBrowserAppBase(body, appPort, enableHttps, httpsDomain, httpsPort);
       const appBasePath = body.vite_app_base_path || "/";
       const browserBackendUrl = installSupabase
-        ? "__SCREENFLOW_SAME_ORIGIN__"
+        ? publicAppUrl
         : (supabaseUrlOverride || body.vite_supabase_url || publicAppUrl);
       const compose = `services:
   web:
@@ -2534,7 +2533,7 @@ ${composeTopLevelNetworks(kongUpstream)}`;
       await patchRemoteLanOriginFallback(conn, `${remoteDir}/repo`, log);
       await patchRemoteRuntimeSupabaseClient(conn, `${remoteDir}/repo`, log);
       if (installSupabase) {
-        const buildInputCheck = await exec(conn, `set -e; grep -Fq "projectId === 'local'" ${remoteDir}/repo/src/integrations/supabase/runtime-client.ts; grep -Fq 'src/integrations/supabase/runtime-client.ts' ${remoteDir}/repo/vite.config.ts; grep -Fq "VITE_SUPABASE_URL: '__SCREENFLOW_SAME_ORIGIN__'" ${remoteDir}/repo/docker-compose.yml; grep -Fq "VITE_SUPABASE_PROJECT_ID: 'local'" ${remoteDir}/repo/docker-compose.yml`);
+        const buildInputCheck = await exec(conn, `set -e; grep -Fq "projectId === 'local'" ${remoteDir}/repo/src/integrations/supabase/runtime-client.ts; grep -Fq 'src/integrations/supabase/runtime-client.ts' ${remoteDir}/repo/vite.config.ts; grep -Eq "VITE_SUPABASE_URL: 'https?://" ${remoteDir}/repo/docker-compose.yml; grep -Fq "VITE_SUPABASE_PROJECT_ID: 'local'" ${remoteDir}/repo/docker-compose.yml`);
         if (buildInputCheck.code !== 0) {
           throw new Error("Les invariants du client LAN sont absents des fichiers de build du premier déploiement.");
         }
@@ -2655,28 +2654,26 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
 
     const freshWebCid = (await exec(conn, `cd ${remoteDir}/repo && (docker compose ps -q web || docker-compose ps -q web) 2>/dev/null | head -1`)).stdout.trim();
     if (!freshWebCid) throw new Error("Le conteneur web est introuvable après le premier build.");
-    // Code splitting can move the runtime client into a secondary chunk, so the
-    // marker must be searched across ALL emitted assets, not only the entry file.
+    // Code splitting can move the runtime client into a secondary chunk. Verify
+    // that the aliased local client was emitted; the build input itself was
+    // already checked to contain an absolute HTTP URL rather than a sentinel.
     const freshBundleCheck = await exec(
       conn,
       `docker exec ${freshWebCid} sh -c 'set -e; ` +
         `test -s /usr/share/nginx/html/index.html || { echo MISSING_INDEX; exit 1; }; ` +
         `count=$(ls /usr/share/nginx/html/assets/*.js 2>/dev/null | wc -l); ` +
         `[ "$count" -gt 0 ] || { echo MISSING_ASSETS; exit 1; }; ` +
-        `if grep -R -l "__SCREENFLOW_SAME_ORIGIN__" /usr/share/nginx/html/assets >/dev/null 2>&1; then echo INVALID_MARKER; exit 1; fi; ` +
         `grep -R -q "screenflow-local-auth-v3" /usr/share/nginx/html/assets 2>/dev/null || { echo RUNTIME_CLIENT_MISSING; exit 1; }; ` +
         `echo OK'`,
     );
     const freshBundleOutput = `${freshBundleCheck.stdout || ""}${freshBundleCheck.stderr || ""}`.trim();
     connectivity.browser_bundle = {
-      ok: freshBundleOutput.includes("OK") && !freshBundleOutput.includes("INVALID_MARKER"),
+      ok: freshBundleOutput.includes("OK"),
       detail: freshBundleOutput.slice(-400) || "contrôle impossible",
     };
     await log(`  • Bundle client : ${connectivity.browser_bundle.ok ? "✓" : "✗"} ${connectivity.browser_bundle.detail}`);
     if (!connectivity.browser_bundle.ok) {
-      const reason = freshBundleOutput.includes("INVALID_MARKER")
-        ? "le marqueur same-origin est transmis tel quel au client backend"
-        : freshBundleOutput.includes("MISSING_ASSETS") || freshBundleOutput.includes("MISSING_INDEX")
+      const reason = freshBundleOutput.includes("MISSING_ASSETS") || freshBundleOutput.includes("MISSING_INDEX")
           ? "les fichiers statiques du build sont absents du conteneur"
           : freshBundleOutput.includes("RUNTIME_CLIENT_MISSING")
             ? "le client backend runtime (alias same-origin) n'est pas inclus dans le build"
@@ -3926,7 +3923,7 @@ async function runRepairWebContainer(body: DeployBody, log: (m: string) => Promi
     // routers without NAT loopback.
     const projectId = localBackendPresent ? "local" : (body.vite_supabase_project_id || "");
     const publicBase = resolveBrowserAppBase(body, appPort, false);
-    const browserBackendUrl = localBackendPresent ? "__SCREENFLOW_SAME_ORIGIN__" : publicBase;
+    const browserBackendUrl = publicBase;
     const quoteYaml = (value: string) => `'${(value || "").replace(/'/g, "''")}'`;
     const compose = `services:
   web:

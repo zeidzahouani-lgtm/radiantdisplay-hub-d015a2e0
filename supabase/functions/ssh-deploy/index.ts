@@ -1715,6 +1715,8 @@ async function runDeploymentJob(
   try {
     await persist({ status: "running", logs: [] });
     let directResult: any = null;
+    // Legacy repair actions still publish their result through this slot. The
+    // main deployment returns its own job-scoped result and never reads it.
     (globalThis as any).__lastDeployResult = null;
     if (body.action === "reset_admin_password") {
       await runResetAdminPassword(body, log);
@@ -1757,7 +1759,7 @@ async function runDeploymentJob(
     } else if (body.action === "network_set_container_ip") {
       directResult = await runNetworkSetContainerIp(body, log);
     } else {
-      await runDeployment(body, log);
+      directResult = await runDeployment(body, log);
     }
     const result = directResult ?? (globalThis as any).__lastDeployResult ?? null;
     const resultFailed = !!result && typeof result === "object" && "ok" in result && result.ok === false;
@@ -1949,6 +1951,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
   let supabaseUrlOverride = "";
   let supabaseAnonOverride = "";
   let supabaseProjectIdOverride = "";
+  let postgresOnlyResult: { image: string; port: string; password: string; host: string } | null = null;
   let earlyWebStarted = false;
   // L'edge function est coupée par le runtime après ~400s : on sort proprement avant.
   const deploymentDeadline = Date.now() + 8 * 60 * 1000;
@@ -2286,7 +2289,7 @@ async function runDeployment(body: DeployBody, log: (m: string) => Promise<void>
         await log(`  • Image:      ${postgresImage}`);
         await log(`  • Connexion locale serveur: postgres://postgres:${postgresPw}@127.0.0.1:${supaDbPort}/postgres`);
         await log(`  • Mot de passe: ${postgresPw}  (notez-le, il ne sera pas réaffiché)`);
-        (globalThis as any).__pgOnlyResult = { image: postgresImage, port: supaDbPort, password: postgresPw, host: body.host };
+        postgresOnlyResult = { image: postgresImage, port: supaDbPort, password: postgresPw, host: body.host };
       }
 
       if (installSupabase && isExistingSupabase) {
@@ -2611,9 +2614,12 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
     const localAppUrl = enableHttps
       ? `https://${localIp}${httpsPort === "443" ? "" : `:${httpsPort}`}`
       : `http://${localIp}${appPort === "80" ? "" : `:${appPort}`}`;
-    const appCheck = await exec(conn, `curl -k -s -o /dev/null -w "%{http_code}" --max-time 10 ${localAppUrl} || echo FAIL`);
+      const loopbackAppUrl = enableHttps
+        ? `https://127.0.0.1${httpsPort === "443" ? "" : `:${httpsPort}`}`
+        : `http://127.0.0.1${appPort === "80" ? "" : `:${appPort}`}`;
+      const appCheck = await exec(conn, `curl -k -s -o /dev/null -w "%{http_code}" --max-time 10 ${shQuote(loopbackAppUrl)} || echo FAIL`);
     const appCode = (appCheck.stdout || "").trim();
-    connectivity.app = { ok: /^(200|301|302|304)$/.test(appCode), detail: `HTTP ${appCode} sur ${localAppUrl} (IP LAN réelle)` };
+      connectivity.app = { ok: /^(200|301|302|304)$/.test(appCode), detail: `HTTP ${appCode} sur ${loopbackAppUrl} (boucle locale serveur)` };
     await log(`  • App         : ${connectivity.app.ok ? "✓" : "✗"} ${connectivity.app.detail}`);
 
     // A 200 on `/` only proves that Nginx can return index.html. It does not
@@ -2623,7 +2629,7 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
     const loginPath = `${normalizedBasePath ? `/${normalizedBasePath}` : ""}/login`;
     const frontendProbe = await exec(conn,
       `set -o pipefail; ` +
-      `BASE=${shQuote(localAppUrl)}; LOGIN=${shQuote(loginPath)}; ` +
+      `BASE=${shQuote(loopbackAppUrl)}; LOGIN=${shQuote(loginPath)}; ` +
       `HTML=$(curl -kfsS --max-time 15 "$BASE$LOGIN") || { echo 'LOGIN_HTTP_FAILED'; exit 21; }; ` +
       `printf '%s' "$HTML" | grep -Fq 'id="root"' || { echo 'LOGIN_INDEX_INVALID'; exit 22; }; ` +
       `ASSET=$(printf '%s' "$HTML" | grep -oE 'src="[^"]+\.js([^"]*)?"' | head -1 | cut -d'"' -f2); ` +
@@ -2649,7 +2655,13 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
 
     const freshWebCid = (await exec(conn, `cd ${remoteDir}/repo && (docker compose ps -q web || docker-compose ps -q web) 2>/dev/null | head -1`)).stdout.trim();
     if (!freshWebCid) throw new Error("Le conteneur web est introuvable après le premier build.");
-    const freshBundleCheck = await exec(conn, `docker exec ${freshWebCid} sh -c 'if grep -R -q "const [A-Za-z0-9_$]*=\"__SCREENFLOW_SAME_ORIGIN__\".*createClient\|YTe(\"__SCREENFLOW_SAME_ORIGIN__\"" /usr/share/nginx/html/assets 2>/dev/null; then echo INVALID_MARKER; else echo OK; fi'`);
+    const freshBundleCheck = await exec(
+      conn,
+      `docker exec ${freshWebCid} sh -c 'set -e; test -s /usr/share/nginx/html/index.html; ` +
+        `asset=$(grep -oE "src=\"[^\"]+\\.js([^\"]*)?\"" /usr/share/nginx/html/index.html | head -1 | cut -d\" -f2); ` +
+        `test -n "$asset"; asset="/usr/share/nginx/html${'$'}{asset%%\?*}"; test -s "$asset"; ` +
+        `grep -q "screenflow-local-auth-v3" "$asset"; echo OK'`,
+    );
     connectivity.browser_bundle = {
       ok: (freshBundleCheck.stdout || "").includes("OK"),
       detail: (freshBundleCheck.stdout || freshBundleCheck.stderr || "contrôle impossible").trim(),
@@ -2788,8 +2800,7 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
     const url = appUrl;
     await log(`🚀 Deployment complete — accessible at ${url}`);
 
-    const pgOnly = (globalThis as any).__pgOnlyResult || null;
-    (globalThis as any).__lastDeployResult = {
+    return {
       url,
       db_stack: dbStack,
       postgres_image: (installSupabase || installPostgresOnly) ? postgresImage : null,
@@ -2799,7 +2810,7 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
         anon_key: supabaseAnonOverride,
         studio_url: `http://${localIp}:${supaStudioPort}`,
       } : null,
-      postgres_only: pgOnly,
+      postgres_only: postgresOnlyResult,
     };
   } catch (innerErr: any) {
     try { conn.end(); } catch (_) {}

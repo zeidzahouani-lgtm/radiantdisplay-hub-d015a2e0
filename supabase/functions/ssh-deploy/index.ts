@@ -1715,6 +1715,9 @@ async function runDeploymentJob(
   try {
     await persist({ status: "running", logs: [] });
     let directResult: any = null;
+    // Legacy repair actions still publish their result through this slot. The
+    // main deployment returns its own job-scoped result and never reads it.
+    (globalThis as any).__lastDeployResult = null;
     if (body.action === "reset_admin_password") {
       await runResetAdminPassword(body, log);
     } else if (body.action === "check_admin_status") {

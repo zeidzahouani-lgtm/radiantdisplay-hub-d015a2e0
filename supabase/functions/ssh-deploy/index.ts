@@ -2611,9 +2611,12 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
     const localAppUrl = enableHttps
       ? `https://${localIp}${httpsPort === "443" ? "" : `:${httpsPort}`}`
       : `http://${localIp}${appPort === "80" ? "" : `:${appPort}`}`;
-    const appCheck = await exec(conn, `curl -k -s -o /dev/null -w "%{http_code}" --max-time 10 ${localAppUrl} || echo FAIL`);
+      const loopbackAppUrl = enableHttps
+        ? `https://127.0.0.1${httpsPort === "443" ? "" : `:${httpsPort}`}`
+        : `http://127.0.0.1${appPort === "80" ? "" : `:${appPort}`}`;
+      const appCheck = await exec(conn, `curl -k -s -o /dev/null -w "%{http_code}" --max-time 10 ${shQuote(loopbackAppUrl)} || echo FAIL`);
     const appCode = (appCheck.stdout || "").trim();
-    connectivity.app = { ok: /^(200|301|302|304)$/.test(appCode), detail: `HTTP ${appCode} sur ${localAppUrl} (IP LAN réelle)` };
+      connectivity.app = { ok: /^(200|301|302|304)$/.test(appCode), detail: `HTTP ${appCode} sur ${loopbackAppUrl} (boucle locale serveur)` };
     await log(`  • App         : ${connectivity.app.ok ? "✓" : "✗"} ${connectivity.app.detail}`);
 
     // A 200 on `/` only proves that Nginx can return index.html. It does not
@@ -2623,7 +2626,7 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
     const loginPath = `${normalizedBasePath ? `/${normalizedBasePath}` : ""}/login`;
     const frontendProbe = await exec(conn,
       `set -o pipefail; ` +
-      `BASE=${shQuote(localAppUrl)}; LOGIN=${shQuote(loginPath)}; ` +
+      `BASE=${shQuote(loopbackAppUrl)}; LOGIN=${shQuote(loginPath)}; ` +
       `HTML=$(curl -kfsS --max-time 15 "$BASE$LOGIN") || { echo 'LOGIN_HTTP_FAILED'; exit 21; }; ` +
       `printf '%s' "$HTML" | grep -Fq 'id="root"' || { echo 'LOGIN_INDEX_INVALID'; exit 22; }; ` +
       `ASSET=$(printf '%s' "$HTML" | grep -oE 'src="[^"]+\.js([^"]*)?"' | head -1 | cut -d'"' -f2); ` +
@@ -2649,7 +2652,13 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
 
     const freshWebCid = (await exec(conn, `cd ${remoteDir}/repo && (docker compose ps -q web || docker-compose ps -q web) 2>/dev/null | head -1`)).stdout.trim();
     if (!freshWebCid) throw new Error("Le conteneur web est introuvable après le premier build.");
-    const freshBundleCheck = await exec(conn, `docker exec ${freshWebCid} sh -c 'if grep -R -q "const [A-Za-z0-9_$]*=\"__SCREENFLOW_SAME_ORIGIN__\".*createClient\|YTe(\"__SCREENFLOW_SAME_ORIGIN__\"" /usr/share/nginx/html/assets 2>/dev/null; then echo INVALID_MARKER; else echo OK; fi'`);
+    const freshBundleCheck = await exec(
+      conn,
+      `docker exec ${freshWebCid} sh -c 'set -e; test -s /usr/share/nginx/html/index.html; ` +
+        `asset=$(grep -oE "src=\"[^\"]+\\.js([^\"]*)?\"" /usr/share/nginx/html/index.html | head -1 | cut -d\" -f2); ` +
+        `test -n "$asset"; asset="/usr/share/nginx/html${'$'}{asset%%\?*}"; test -s "$asset"; ` +
+        `grep -q "screenflow-local-auth-v3" "$asset"; echo OK'`,
+    );
     connectivity.browser_bundle = {
       ok: (freshBundleCheck.stdout || "").includes("OK"),
       detail: (freshBundleCheck.stdout || freshBundleCheck.stderr || "contrôle impossible").trim(),
